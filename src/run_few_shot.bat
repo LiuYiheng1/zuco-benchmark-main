@@ -1,0 +1,1 @@
+python d:/pycharmproject/zuco-benchmark-main/src/few_shot_calibration.py

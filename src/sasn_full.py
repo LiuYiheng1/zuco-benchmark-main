@@ -1,0 +1,262 @@
+"""SASN: Subject-Adaptive Shrinkage Normalization"""
+import os
+os.chdir('d:/pycharmproject/zuco-benchmark-main/src')
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, roc_auc_score
+from sklearn.cluster import KMeans
+
+FEATURES_DIR = "features"
+RESULTS_DIR = "results/personalized"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+Y_SUBJECTS = ['YAC', 'YAG', 'YAK', 'YDG', 'YDR', 'YFR', 'YFS', 'YHS', 'YIS', 'YLS', 'YMD', 'YRK', 'YRP', 'YSD', 'YSL', 'YTL']
+
+def load_eeg_data(subject):
+    path = os.path.join(FEATURES_DIR, f"{subject}_electrode_features_all.npy")
+    if not os.path.exists(path):
+        return None, None
+    data = np.load(path, allow_pickle=True).item()
+    X, y = [], []
+    for key, values in data.items():
+        parts = key.split("_")
+        if len(parts) >= 2 and parts[1] == "NR":
+            label = 1
+        elif len(parts) >= 2 and parts[1] == "TSR":
+            label = 0
+        else:
+            continue
+        features = np.array(values[:-1], dtype=np.float64)
+        X.append(features)
+        y.append(label)
+    return np.array(X), np.array(y)
+
+def kmeans_sampling_label_free(X_pool, n_select):
+    k = min(n_select, len(X_pool))
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(X_pool)
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=3)
+    kmeans.fit(X_s)
+    selected = []
+    for c in range(k):
+        idx = np.where(kmeans.labels_ == c)[0]
+        if len(idx) > 0:
+            centroid = kmeans.cluster_centers_[c]
+            dists = np.linalg.norm(X_s[idx] - centroid, axis=1)
+            selected.append(idx[np.argmin(dists)])
+    while len(selected) < n_select:
+        for c in range(k):
+            idx = np.where(kmeans.labels_ == c)[0]
+            for i in idx:
+                if i not in selected:
+                    selected.append(i)
+                    if len(selected) >= n_select:
+                        break
+            if len(selected) >= n_select:
+                break
+    return np.array(selected[:n_select])
+
+def compute_class_stats(X, y, class_label):
+    X_class = X[y == class_label]
+    if len(X_class) == 0:
+        return None, None
+    mu = np.mean(X_class, axis=0)
+    sigma = np.std(X_class, axis=0) + 1e-8
+    return mu, sigma
+
+def normalize_by_class(X, mu_0, sigma_0, mu_1, sigma_1):
+    X_norm = np.zeros_like(X)
+    X_norm[0] = (X[0] - mu_0) / sigma_0 if len(X) > 0 else X[0]
+    for i in range(len(X)):
+        if np.all(X[i] == X[0]):
+            X_norm[i] = (X[i] - mu_0) / sigma_0
+        else:
+            X_norm[i] = (X[i] - mu_1) / sigma_1
+    return X_norm
+
+def train_and_evaluate(X_cal, y_cal, X_test, y_test):
+    scaler = StandardScaler()
+    X_cal_s = scaler.fit_transform(X_cal)
+    X_test_s = scaler.transform(X_test)
+    clf = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=200, random_state=42)
+    clf.fit(X_cal_s, y_cal)
+    probs = clf.predict_proba(X_test_s)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    acc = accuracy_score(y_test, preds)
+    f1 = f1_score(y_test, preds, average='macro')
+    bacc = balanced_accuracy_score(y_test, preds)
+    try:
+        auroc = roc_auc_score(y_test, probs)
+    except:
+        auroc = 0.5
+    return acc, f1, bacc, auroc
+
+def normalize_X(X, y, mu_0, sigma_0, mu_1, sigma_1):
+    X_norm = np.zeros_like(X)
+    mask_0 = (y == 0)
+    mask_1 = (y == 1)
+    X_norm[mask_0] = (X[mask_0] - mu_0) / sigma_0
+    X_norm[mask_1] = (X[mask_1] - mu_1) / sigma_1
+    return X_norm
+
+print('SASN Experiments', flush=True)
+print('='*60, flush=True)
+
+results = []
+shot_settings = [3, 5, 10, 20, 50]
+kappa_values = [5, 10, 20, 50, 100]
+seeds = [0, 1, 2, 3, 4]
+
+for seed in seeds:
+    print(f'\nSeed {seed}:', flush=True)
+    for held_out in Y_SUBJECTS:
+        X_train_all, y_train_all = [], []
+        for subj in Y_SUBJECTS:
+            if subj == held_out:
+                continue
+            X, y = load_eeg_data(subj)
+            if X is not None:
+                X_train_all.append(X)
+                y_train_all.append(y)
+
+        X_test_orig, y_test_orig = load_eeg_data(held_out)
+        if len(X_train_all) == 0 or X_test_orig is None:
+            continue
+
+        X_train_all = np.vstack(X_train_all)
+        y_train_all = np.concatenate(y_train_all)
+
+        mu_source_0, sigma_source_0 = compute_class_stats(X_train_all, y_train_all, 0)
+        mu_source_1, sigma_source_1 = compute_class_stats(X_train_all, y_train_all, 1)
+
+        n_samples = len(y_test_orig)
+        np.random.seed(seed)
+        indices = np.random.permutation(n_samples)
+        test_size = n_samples // 3
+        test_indices = indices[:test_size]
+        cal_pool_indices = indices[test_size:]
+
+        X_test = X_test_orig[test_indices]
+        y_test = y_test_orig[test_indices]
+        X_cal_pool = X_test_orig[cal_pool_indices]
+        y_cal_pool = y_test_orig[cal_pool_indices]
+
+        print(f'  {held_out}: test={len(y_test)}, cal_pool={len(y_cal_pool)}', flush=True)
+
+        for n_cal in shot_settings:
+            if n_cal * 2 > len(cal_pool_indices):
+                continue
+
+            class_0_idx = np.where(y_cal_pool == 0)[0]
+            class_1_idx = np.where(y_cal_pool == 1)[0]
+            np.random.shuffle(class_0_idx)
+            np.random.shuffle(class_1_idx)
+            cal_idx = np.concatenate([class_0_idx[:n_cal], class_1_idx[:n_cal]])
+
+            X_cal = X_cal_pool[cal_idx]
+            y_cal = y_cal_pool[cal_idx]
+
+            if len(np.unique(y_cal)) < 2:
+                continue
+
+            acc, f1, bacc, auroc = train_and_evaluate(X_cal, y_cal, X_test, y_test)
+            results.append({
+                'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                'method': 'StandardScaler', 'kappa': 0,
+                'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+            })
+
+            X_cal_source_norm = normalize_X(X_cal, y_cal, mu_source_0, sigma_source_0, mu_source_1, sigma_source_1)
+            X_test_source_norm = normalize_X(X_test, y_test, mu_source_0, sigma_source_0, mu_source_1, sigma_source_1)
+            acc, f1, bacc, auroc = train_and_evaluate(X_cal_source_norm, y_cal, X_test_source_norm, y_test)
+            results.append({
+                'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                'method': 'SourceNorm', 'kappa': 0,
+                'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+            })
+
+            mu_target_0, sigma_target_0 = compute_class_stats(X_cal_pool, y_cal_pool, 0)
+            mu_target_1, sigma_target_1 = compute_class_stats(X_cal_pool, y_cal_pool, 1)
+            if mu_target_0 is not None and mu_target_1 is not None:
+                X_cal_target_norm = normalize_X(X_cal, y_cal, mu_target_0, sigma_target_0, mu_target_1, sigma_target_1)
+                X_test_target_norm = normalize_X(X_test, y_test, mu_target_0, sigma_target_0, mu_target_1, sigma_target_1)
+                acc, f1, bacc, auroc = train_and_evaluate(X_cal_target_norm, y_cal, X_test_target_norm, y_test)
+                results.append({
+                    'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                    'method': 'TargetNorm', 'kappa': 0,
+                    'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+                })
+
+            for kappa in kappa_values:
+                n_target = min(np.sum(y_cal_pool == 0), np.sum(y_cal_pool == 1))
+                rho = n_target / (n_target + kappa)
+
+                mu_sasn_0 = rho * mu_target_0 + (1 - rho) * mu_source_0
+                sigma_sasn_0 = rho * sigma_target_0 + (1 - rho) * sigma_source_0
+                mu_sasn_1 = rho * mu_target_1 + (1 - rho) * mu_source_1
+                sigma_sasn_1 = rho * sigma_target_1 + (1 - rho) * sigma_source_1
+
+                X_cal_sasn = normalize_X(X_cal, y_cal, mu_sasn_0, sigma_sasn_0, mu_sasn_1, sigma_sasn_1)
+                X_test_sasn = normalize_X(X_test, y_test, mu_sasn_0, sigma_sasn_0, mu_sasn_1, sigma_sasn_1)
+                acc, f1, bacc, auroc = train_and_evaluate(X_cal_sasn, y_cal, X_test_sasn, y_test)
+                results.append({
+                    'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                    'method': 'SASN', 'kappa': kappa,
+                    'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+                })
+
+            cal_idx_accs = kmeans_sampling_label_free(X_cal_pool, n_cal * 2)
+            X_cal_accs = X_cal_pool[cal_idx_accs]
+            y_cal_accs = y_cal_pool[cal_idx_accs]
+            acc, f1, bacc, auroc = train_and_evaluate(X_cal_accs, y_cal_accs, X_test, y_test)
+            results.append({
+                'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                'method': 'ACCS', 'kappa': 0,
+                'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+            })
+
+            for kappa in kappa_values:
+                n_target = min(np.sum(y_cal_pool == 0), np.sum(y_cal_pool == 1))
+                rho = n_target / (n_target + kappa)
+
+                mu_sasn_0 = rho * mu_target_0 + (1 - rho) * mu_source_0
+                sigma_sasn_0 = rho * sigma_target_0 + (1 - rho) * sigma_source_0
+                mu_sasn_1 = rho * mu_target_1 + (1 - rho) * mu_source_1
+                sigma_sasn_1 = rho * sigma_target_1 + (1 - rho) * sigma_source_1
+
+                X_cal_accs_sasn = normalize_X(X_cal_accs, y_cal_accs, mu_sasn_0, sigma_sasn_0, mu_sasn_1, sigma_sasn_1)
+                X_test_sasn = normalize_X(X_test, y_test, mu_sasn_0, sigma_sasn_0, mu_sasn_1, sigma_sasn_1)
+                acc, f1, bacc, auroc = train_and_evaluate(X_cal_accs_sasn, y_cal_accs, X_test_sasn, y_test)
+                results.append({
+                    'seed': seed, 'subject': held_out, 'n_cal': n_cal,
+                    'method': 'SASN_ACCS', 'kappa': kappa,
+                    'accuracy': acc, 'macro_f1': f1, 'balanced_accuracy': bacc, 'auroc': auroc
+                })
+
+df = pd.DataFrame(results)
+df.to_csv(RESULTS_DIR + '/sasn_results.csv', index=False)
+
+print('\n' + '='*60, flush=True)
+print('SASN Results Summary', flush=True)
+print('='*60, flush=True)
+
+for n_cal in shot_settings:
+    print(f'\n{n_cal}-shot per class:', flush=True)
+    baseline = df[(df['method'] == 'StandardScaler') & (df['n_cal'] == n_cal)]['accuracy'].mean()
+    accs = df[(df['method'] == 'ACCS') & (df['n_cal'] == n_cal)]['accuracy'].mean()
+    source_norm = df[(df['method'] == 'SourceNorm') & (df['n_cal'] == n_cal)]['accuracy'].mean()
+    target_norm = df[(df['method'] == 'TargetNorm') & (df['n_cal'] == n_cal)]['accuracy'].mean()
+
+    print(f'  StandardScaler: {baseline:.4f}', flush=True)
+    print(f'  SourceNorm: {source_norm:.4f} (gap={source_norm-baseline:+.4f})', flush=True)
+    print(f'  TargetNorm: {target_norm:.4f} (gap={target_norm-baseline:+.4f})', flush=True)
+    print(f'  ACCS: {accs:.4f} (gap={accs-baseline:+.4f})', flush=True)
+
+    for kappa in kappa_values:
+        sasn = df[(df['method'] == 'SASN') & (df['n_cal'] == n_cal) & (df['kappa'] == kappa)]['accuracy'].mean()
+        sasn_accs = df[(df['method'] == 'SASN_ACCS') & (df['n_cal'] == n_cal) & (df['kappa'] == kappa)]['accuracy'].mean()
+        print(f'  SASN (kappa={kappa}): {sasn:.4f} (gap={sasn-baseline:+.4f}) | SASN_ACCS: {sasn_accs:.4f} (gap={sasn_accs-accs:+.4f})', flush=True)
+
+print('\nDone!', flush=True)

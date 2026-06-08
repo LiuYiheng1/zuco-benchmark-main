@@ -1,0 +1,1 @@
+python d:/pycharmproject/zuco-benchmark-main/src/eeg_adaptation_full.py

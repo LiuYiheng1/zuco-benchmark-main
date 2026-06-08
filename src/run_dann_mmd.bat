@@ -1,0 +1,1 @@
+python d:/pycharmproject/zuco-benchmark-main/src/dann_mmd_pilot.py

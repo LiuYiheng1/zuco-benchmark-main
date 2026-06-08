@@ -1,0 +1,1 @@
+python d:/pycharmproject/zuco-benchmark-main/src/step2_coral.py
