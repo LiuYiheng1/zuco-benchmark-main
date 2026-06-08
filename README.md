@@ -70,3 +70,7 @@ To experiment with different models or feature combinations, you can use the [va
 If you have ```create_submission``` enabled in the [config](https://github.com/norahollenstein/zuco-benchmark/blob/main/src/config.py), ```benchmark_baseline.py``` will automatically create a submission file in the correct format.  
 For the submission format, check out the [example files](https://github.com/norahollenstein/zuco-benchmark/tree/main/src/submissions).  
 Head to [EvalAI](https://eval.ai/web/challenges/challenge-page/2125/submission), fill in the required information and upload your submission.json. 
+
+## Repository
+
+GitHub initialization title: `zuco-benchmark-main`.
