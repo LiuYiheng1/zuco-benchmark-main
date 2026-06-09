@@ -8,6 +8,7 @@ set -euo pipefail
 PROJECT_DIR="/home/yiheng/projects/zuco-benchmark-main"
 CONDA_SH="/opt/anaconda3/etc/profile.d/conda.sh"
 CONDA_ENV="${CONDA_ENV:-zuco_benchmark_gpu}"
+SKIP_GIT_PULL="${SKIP_GIT_PULL:-0}"
 
 RUN_MODE="${RUN_MODE:-pilot_parallel_smoke}"
 DRY_RUN="${DRY_RUN:-1}"
@@ -28,7 +29,11 @@ MAX_LEN="${MAX_LEN:-80}"
 DEVICE="${DEVICE:-cuda}"
 
 cd "$PROJECT_DIR"
-git -c http.version=HTTP/1.1 pull --ff-only
+if [[ "$SKIP_GIT_PULL" == "1" ]]; then
+    echo "SKIP_GIT_PULL=1, skipping git pull"
+else
+    git -c http.version=HTTP/1.1 pull --ff-only
+fi
 
 if [[ ! -f "$CONDA_SH" ]]; then
     echo "Conda activation script not found: $CONDA_SH" >&2

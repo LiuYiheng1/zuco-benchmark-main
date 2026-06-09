@@ -4,9 +4,14 @@ set -euo pipefail
 PROJECT_DIR="/home/yiheng/projects/zuco-benchmark-main"
 CONDA_SH="/opt/anaconda3/etc/profile.d/conda.sh"
 CONDA_ENV="${CONDA_ENV:-zuco_benchmark_gpu}"
+SKIP_GIT_PULL="${SKIP_GIT_PULL:-0}"
 
 cd "$PROJECT_DIR"
-git pull
+if [[ "$SKIP_GIT_PULL" == "1" ]]; then
+    echo "SKIP_GIT_PULL=1, skipping git pull"
+else
+    git pull
+fi
 
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
