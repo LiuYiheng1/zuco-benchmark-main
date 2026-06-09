@@ -1,3 +1,7 @@
+param(
+    [string]$RemoteScript = "scripts/run_remote.sh"
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = "D:\pycharmproject\zuco-benchmark-main"
@@ -40,5 +44,5 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-ssh $RemoteHost "cd '$RemoteProjectDir' && bash scripts/run_remote.sh"
+ssh $RemoteHost "cd '$RemoteProjectDir' && bash '$RemoteScript'"
 exit $LASTEXITCODE
