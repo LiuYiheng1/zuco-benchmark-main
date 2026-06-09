@@ -48,7 +48,7 @@ case "$RUN_MODE" in
         ;;
     full_parallel_short)
         SEQUENCE_JSONL="$FULL_SEQUENCE_JSONL"
-        MODEL="${FULL_MODEL:-full_cnogsm}"
+        MODEL="${MODEL:-${FULL_MODEL:-full_cnogsm}}"
         EPOCHS="${FULL_EPOCHS:-3}"
         PATIENCE="${FULL_PATIENCE:-2}"
         BATCH_SIZE="${FULL_BATCH_SIZE:-16}"
@@ -57,7 +57,7 @@ case "$RUN_MODE" in
         ;;
     full_loso)
         SEQUENCE_JSONL="$FULL_SEQUENCE_JSONL"
-        MODEL="${FULL_MODEL:-full_cnogsm}"
+        MODEL="${MODEL:-${FULL_MODEL:-full_cnogsm}}"
         EPOCHS="${FULL_EPOCHS:-30}"
         PATIENCE="${FULL_PATIENCE:-8}"
         BATCH_SIZE="${FULL_BATCH_SIZE:-32}"
@@ -162,7 +162,7 @@ for ((i = 0; i < ${#PROTOCOLS[@]}; i++)); do
     protocol="${PROTOCOLS[$i]}"
     seed="${SEEDS[$i]}"
     output_dir="outputs/adagtcn_parallel/$RUN_MODE/$RUN_TAG/$protocol/${MODEL}_seed${seed}"
-    log_file="$LOG_DIR/${RUN_MODE}_${protocol}_gpu${gpu}_${TIMESTAMP}.log"
+    log_file="$LOG_DIR/${RUN_MODE}_${MODEL}_${protocol}_gpu${gpu}_${TIMESTAMP}.log"
 
     cmd=(
         python -m src.adagtcn_aligned.train_cnogsm
