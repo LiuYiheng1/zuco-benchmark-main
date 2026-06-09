@@ -15,7 +15,7 @@ GPUS_CSV="${GPUS:-0,1,2,3,4,5,6,7,8}"
 
 SPLIT_JSON="${SPLIT_JSON:-reports/adagtcn_aligned/subject_splits.json}"
 PILOT_SEQUENCE_JSONL="${PILOT_SEQUENCE_JSONL:-data/adagtcn_aligned/pilot_y16_60sent_band_vectors_sequences.jsonl}"
-FULL_SEQUENCE_JSONL="${FULL_SEQUENCE_JSONL:-data/adagtcn_aligned/full_y16_band_vectors_sequences.jsonl}"
+FULL_SEQUENCE_JSONL="${FULL_SEQUENCE_JSONL:-data/adagtcn_aligned/paper_y16_full_band_vectors_sequences.jsonl}"
 
 BASE_PROTOCOL="${BASE_PROTOCOL:-Y16_12_2_2_seed0}"
 MODEL="${MODEL:-gaze_only_ssm}"
@@ -27,7 +27,7 @@ MAX_LEN="${MAX_LEN:-80}"
 DEVICE="${DEVICE:-cuda}"
 
 cd "$PROJECT_DIR"
-git pull
+git -c http.version=HTTP/1.1 pull --ff-only
 
 if [[ ! -f "$CONDA_SH" ]]; then
     echo "Conda activation script not found: $CONDA_SH" >&2
@@ -40,23 +40,32 @@ case "$RUN_MODE" in
     pilot_parallel_smoke)
         SEQUENCE_JSONL="$PILOT_SEQUENCE_JSONL"
         ;;
-    full)
+    full_parallel_short)
         SEQUENCE_JSONL="$FULL_SEQUENCE_JSONL"
-        MODEL="${FULL_MODEL:-$MODEL}"
-        EPOCHS="${FULL_EPOCHS:-$EPOCHS}"
-        PATIENCE="${FULL_PATIENCE:-$PATIENCE}"
-        BATCH_SIZE="${FULL_BATCH_SIZE:-$BATCH_SIZE}"
-        HIDDEN_DIM="${FULL_HIDDEN_DIM:-$HIDDEN_DIM}"
-        MAX_LEN="${FULL_MAX_LEN:-$MAX_LEN}"
+        MODEL="${FULL_MODEL:-full_cnogsm}"
+        EPOCHS="${FULL_EPOCHS:-3}"
+        PATIENCE="${FULL_PATIENCE:-2}"
+        BATCH_SIZE="${FULL_BATCH_SIZE:-16}"
+        HIDDEN_DIM="${FULL_HIDDEN_DIM:-64}"
+        MAX_LEN="${FULL_MAX_LEN:-80}"
+        ;;
+    full_loso)
+        SEQUENCE_JSONL="$FULL_SEQUENCE_JSONL"
+        MODEL="${FULL_MODEL:-full_cnogsm}"
+        EPOCHS="${FULL_EPOCHS:-30}"
+        PATIENCE="${FULL_PATIENCE:-8}"
+        BATCH_SIZE="${FULL_BATCH_SIZE:-32}"
+        HIDDEN_DIM="${FULL_HIDDEN_DIM:-64}"
+        MAX_LEN="${FULL_MAX_LEN:-80}"
         if [[ ! -f "$SEQUENCE_JSONL" ]]; then
             echo "Full-mode JSONL not found: $SEQUENCE_JSONL" >&2
-            echo "Set FULL_SEQUENCE_JSONL to the confirmed full training JSONL before running RUN_MODE=full." >&2
+            echo "Set FULL_SEQUENCE_JSONL to the confirmed full training JSONL before running a full mode." >&2
             exit 1
         fi
         ;;
     *)
         echo "Unsupported RUN_MODE: $RUN_MODE" >&2
-        echo "Supported values: pilot_parallel_smoke, full" >&2
+        echo "Supported values: pilot_parallel_smoke, full_parallel_short, full_loso" >&2
         exit 1
         ;;
 esac
@@ -96,7 +105,12 @@ PY
 PROTOCOLS=()
 SEEDS=()
 if [[ "${#LOSO_PROTOCOLS[@]}" -gt 0 ]]; then
-    for ((i = 0; i < ${#GPUS[@]} && i < ${#LOSO_PROTOCOLS[@]}; i++)); do
+    protocol_limit="${#LOSO_PROTOCOLS[@]}"
+    if [[ "$RUN_MODE" != "full_loso" ]] && [[ "$protocol_limit" -gt "${#GPUS[@]}" ]]; then
+        protocol_limit="${#GPUS[@]}"
+    fi
+
+    for ((i = 0; i < protocol_limit; i++)); do
         PROTOCOLS+=("${LOSO_PROTOCOLS[$i]}")
         SEEDS+=("0")
     done
@@ -133,13 +147,15 @@ print_command() {
     printf '# output_dir=%s protocol=%s seed=%s\n' "$output_dir" "$protocol" "$seed"
 }
 
+FAILED=0
 PIDS=()
+PID_LABELS=()
 for ((i = 0; i < ${#PROTOCOLS[@]}; i++)); do
-    gpu="${GPUS[$i]}"
+    gpu="${GPUS[$((i % ${#GPUS[@]}))]}"
     protocol="${PROTOCOLS[$i]}"
     seed="${SEEDS[$i]}"
     output_dir="outputs/adagtcn_parallel/$RUN_MODE/$protocol/${MODEL}_seed${seed}"
-    log_file="$LOG_DIR/${TIMESTAMP}_gpu${gpu}_${protocol}_${MODEL}_seed${seed}.log"
+    log_file="$LOG_DIR/${RUN_MODE}_${protocol}_gpu${gpu}_${TIMESTAMP}.log"
 
     cmd=(
         python -m src.adagtcn_aligned.train_cnogsm
@@ -170,19 +186,26 @@ for ((i = 0; i < ${#PROTOCOLS[@]}; i++)); do
     echo "Starting gpu=$gpu protocol=$protocol seed=$seed log=$log_file"
     CUDA_VISIBLE_DEVICES="$gpu" "${cmd[@]}" > "$log_file" 2>&1 &
     PIDS+=("$!")
+    PID_LABELS+=("gpu=$gpu protocol=$protocol seed=$seed")
+
+    if [[ "${#PIDS[@]}" -ge "${#GPUS[@]}" ]] || [[ "$i" -eq "$((${#PROTOCOLS[@]} - 1))" ]]; then
+        NEXT_PIDS=()
+        NEXT_LABELS=()
+        for ((j = 0; j < ${#PIDS[@]}; j++)); do
+            if ! wait "${PIDS[$j]}"; then
+                echo "Task failed: ${PID_LABELS[$j]}" >&2
+                FAILED=1
+            fi
+        done
+        PIDS=("${NEXT_PIDS[@]}")
+        PID_LABELS=("${NEXT_LABELS[@]}")
+    fi
 done
 
 if [[ "$DRY_RUN" == "1" ]]; then
     echo "Dry run only. Set DRY_RUN=0 to launch these single-GPU processes."
     exit 0
 fi
-
-FAILED=0
-for pid in "${PIDS[@]}"; do
-    if ! wait "$pid"; then
-        FAILED=1
-    fi
-done
 
 if [[ "$FAILED" -ne 0 ]]; then
     echo "One or more parallel tasks failed. Check logs in $LOG_DIR." >&2
