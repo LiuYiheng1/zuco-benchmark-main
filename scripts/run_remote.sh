@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="/home/yiheng/projects/zuco-benchmark-main"
 CONDA_SH="/opt/anaconda3/etc/profile.d/conda.sh"
-CONDA_ENV="base"
+CONDA_ENV="${CONDA_ENV:-zuco_benchmark_gpu}"
 
 cd "$PROJECT_DIR"
 git pull

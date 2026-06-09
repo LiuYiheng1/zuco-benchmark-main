@@ -7,7 +7,7 @@ set -euo pipefail
 
 PROJECT_DIR="/home/yiheng/projects/zuco-benchmark-main"
 CONDA_SH="/opt/anaconda3/etc/profile.d/conda.sh"
-CONDA_ENV="${CONDA_ENV:-base}"
+CONDA_ENV="${CONDA_ENV:-zuco_benchmark_gpu}"
 
 RUN_MODE="${RUN_MODE:-pilot_parallel_smoke}"
 DRY_RUN="${DRY_RUN:-1}"
