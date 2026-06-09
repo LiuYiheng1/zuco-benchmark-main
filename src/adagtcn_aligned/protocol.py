@@ -106,18 +106,31 @@ def make_y16_12_2_2(seed: int, subjects: Iterable[str] = Y16_SUBJECTS) -> Subjec
 
 
 def make_y16_loso(subjects: Iterable[str] = Y16_SUBJECTS) -> list[SubjectSplit]:
-    subjects = list(subjects)
+    subjects = sorted(subjects)
     folds = []
-    for held_out in subjects:
-        train = [s for s in subjects if s != held_out]
+    n_subjects = len(subjects)
+    for idx, held_out in enumerate(subjects):
+        val_subject = None
+        for offset in range(1, n_subjects):
+            candidate = subjects[(idx + offset) % n_subjects]
+            if candidate != held_out:
+                val_subject = candidate
+                break
+        if val_subject is None:
+            raise ValueError("LOSO requires at least two subjects.")
+
+        train = [s for s in subjects if s not in {held_out, val_subject}]
         folds.append(
             SubjectSplit(
                 protocol=f"Y16_LOSO_{held_out}",
                 seed=None,
                 train=train,
-                val=[],
+                val=[val_subject],
                 test=[held_out],
-                note="Leave-one-subject-out on the available 16 labeled Y subjects.",
+                note=(
+                    "Leave-one-subject-out on the available 16 labeled Y subjects. "
+                    "LOSO with deterministic inner validation subject; no test-as-validation."
+                ),
             )
         )
     return folds
@@ -216,4 +229,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

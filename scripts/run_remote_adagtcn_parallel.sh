@@ -11,6 +11,7 @@ CONDA_ENV="${CONDA_ENV:-base}"
 
 RUN_MODE="${RUN_MODE:-pilot_parallel_smoke}"
 DRY_RUN="${DRY_RUN:-1}"
+RUN_TAG="${RUN_TAG:-valfix_v1}"
 GPUS_CSV="${GPUS:-0,1,2,3,4,5,6,7,8}"
 
 SPLIT_JSON="${SPLIT_JSON:-reports/adagtcn_aligned/subject_splits.json}"
@@ -121,11 +122,12 @@ else
     done
 fi
 
-LOG_DIR="logs/adagtcn_parallel/$RUN_MODE"
+LOG_DIR="logs/adagtcn_parallel/$RUN_MODE/$RUN_TAG"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 echo "RUN_MODE=$RUN_MODE"
 echo "DRY_RUN=$DRY_RUN"
+echo "RUN_TAG=$RUN_TAG"
 echo "SEQUENCE_JSONL=$SEQUENCE_JSONL"
 echo "SPLIT_JSON=$SPLIT_JSON"
 echo "MODEL=$MODEL"
@@ -154,7 +156,7 @@ for ((i = 0; i < ${#PROTOCOLS[@]}; i++)); do
     gpu="${GPUS[$((i % ${#GPUS[@]}))]}"
     protocol="${PROTOCOLS[$i]}"
     seed="${SEEDS[$i]}"
-    output_dir="outputs/adagtcn_parallel/$RUN_MODE/$protocol/${MODEL}_seed${seed}"
+    output_dir="outputs/adagtcn_parallel/$RUN_MODE/$RUN_TAG/$protocol/${MODEL}_seed${seed}"
     log_file="$LOG_DIR/${RUN_MODE}_${protocol}_gpu${gpu}_${TIMESTAMP}.log"
 
     cmd=(

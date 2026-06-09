@@ -99,8 +99,10 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
 def train_one_model(args: argparse.Namespace, model_name: str, datasets: tuple[Any, Any, Any, dict[str, Any]]) -> dict[str, Any]:
     train_ds, val_ds, test_ds, meta = datasets
     device = torch.device(args.device)
+    if val_ds is None or meta["n_val"] == 0:
+        raise RuntimeError("Validation set is empty. Refusing to use test set for validation.")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds if val_ds is not None else test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = build_model(
