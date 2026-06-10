@@ -381,6 +381,76 @@ class AION(nn.Module):
         return logits, aux
 
 
+class AIONV2(nn.Module):
+    def __init__(
+        self,
+        eeg_dim: int,
+        gaze_dim: int,
+        hidden_dim: int,
+        n_eeg_nodes: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.gaze_input = nn.Sequential(
+            nn.Linear(gaze_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.gaze_prior = GazeControlledStateSpace(hidden_dim, gaze_dim, dropout)
+        self.eeg_encoder = EEGGraphEncoder(eeg_dim, hidden_dim, n_eeg_nodes, dropout)
+        self.eeg_residual = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.zeros_(self.eeg_residual[-1].weight)
+        nn.init.zeros_(self.eeg_residual[-1].bias)
+        self.precision_gate = nn.Linear(hidden_dim * 3, hidden_dim)
+        nn.init.constant_(self.precision_gate.bias, -3.0)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, batch: dict[str, torch.Tensor], grl_scale: float = 1.0) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        eeg = batch["eeg"]
+        gaze = batch["gaze"]
+        step_mask = batch["step_mask"]
+        eeg_mask = batch["eeg_mask"]
+        gaze_mask = batch["gaze_mask"]
+
+        gaze_input = self.gaze_input(gaze) * (step_mask * gaze_mask).clamp(max=1.0).unsqueeze(-1)
+        z_g = self.gaze_prior(gaze_input, step_mask, gaze)
+
+        h_e, _, eeg_aux = self.eeg_encoder(eeg)
+        h_e = h_e * (step_mask * eeg_mask).clamp(max=1.0).unsqueeze(-1)
+        delta_e = self.eeg_residual(h_e)
+        gate_input = torch.cat([z_g, h_e, torch.abs(z_g - h_e)], dim=-1)
+        alpha = torch.sigmoid(self.precision_gate(gate_input))
+        z = self.norm(z_g + alpha * delta_e) * step_mask.unsqueeze(-1)
+        pooled = masked_mean(z, step_mask)
+        logits = self.classifier(pooled)
+
+        denom = step_mask.sum().clamp_min(1.0)
+        alpha_valid = alpha * step_mask.unsqueeze(-1)
+        alpha_mean = alpha_valid.sum() / (denom * alpha.shape[-1])
+        alpha_std = torch.sqrt(torch.square((alpha - alpha_mean) * step_mask.unsqueeze(-1)).sum() / (denom * alpha.shape[-1]))
+        aux = {
+            "aion_v2_alpha_mean": alpha_mean.detach(),
+            "aion_v2_alpha_std": alpha_std.detach(),
+            "aion_v2_delta_norm": (delta_e.norm(dim=-1) * step_mask).sum().detach() / denom,
+            "aion_v2_z_g_norm": (z_g.norm(dim=-1) * step_mask).sum().detach() / denom,
+            "aion_v2_z_final_norm": (z.norm(dim=-1) * step_mask).sum().detach() / denom,
+        }
+        aux.update(eeg_aux)
+        return logits, aux
+
+
 @dataclass
 class ModelConfig:
     eeg_dim: int
@@ -497,6 +567,7 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
         "aion_no_manifold": dict(architecture="aion", use_manifold=False, use_precision=True, use_gaze_control=True),
         "aion_no_precision": dict(architecture="aion", use_manifold=True, use_precision=False, use_gaze_control=True),
         "aion_no_gaze_control": dict(architecture="aion", use_manifold=True, use_precision=True, use_gaze_control=False),
+        "aion_v2": dict(architecture="aion_v2"),
     }
     if name not in presets:
         raise ValueError("Unknown model %s. Available: %s" % (name, sorted(presets)))
@@ -519,5 +590,13 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
             use_manifold=config.use_manifold,
             use_precision=config.use_precision,
             use_gaze_control=config.use_gaze_control,
+        )
+    if config.architecture == "aion_v2":
+        return AIONV2(
+            eeg_dim=config.eeg_dim,
+            gaze_dim=config.gaze_dim,
+            hidden_dim=config.hidden_dim,
+            n_eeg_nodes=config.n_eeg_nodes,
+            dropout=config.dropout,
         )
     return CNOGSM(config)

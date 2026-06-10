@@ -32,6 +32,7 @@ ABLATIONS = [
 
 AION_MODELS = [
     "aion",
+    "aion_v2",
     "aion_no_manifold",
     "aion_no_precision",
     "aion_no_gaze_control",
@@ -141,21 +142,30 @@ def train_one_model(args: argparse.Namespace, model_name: str, datasets: tuple[A
     for epoch in range(1, args.epochs + 1):
         model.train()
         losses = []
+        aux_logs: dict[str, list[float]] = {}
         for batch in train_loader:
             batch = to_device(batch, device)
             optimizer.zero_grad()
             grl_scale = min(1.0, float(epoch) / max(args.epochs // 2, 1))
             logits, aux = model(batch, grl_scale=grl_scale)
             ce = F.cross_entropy(logits, batch["y"])
-            aux_loss, _ = compute_aux_loss(aux, batch, weights)
+            aux_loss, batch_aux_logs = compute_aux_loss(aux, batch, weights)
             loss = ce + aux_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            for key, value in batch_aux_logs.items():
+                aux_logs.setdefault(key, []).append(value)
+            for key, value in aux.items():
+                if key in batch_aux_logs or key == "subject_logits" or not torch.is_tensor(value) or value.numel() != 1:
+                    continue
+                aux_logs.setdefault(key, []).append(float(value.detach().cpu()))
 
         val_metrics = evaluate(model, val_loader, device)
         row = {"epoch": epoch, "loss": float(np.mean(losses)) if losses else 0.0}
+        for key, values in aux_logs.items():
+            row[key] = float(np.mean(values)) if values else 0.0
         row.update({"val_" + k: v for k, v in val_metrics.items()})
         history.append(row)
 
