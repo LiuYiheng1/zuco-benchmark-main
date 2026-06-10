@@ -81,40 +81,43 @@ def wilcoxon_p(values: list[float], baseline: float) -> float:
 
 def paired_stats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
-    full_rows = [row for row in rows if row.get("ablation") == "full"]
+    ablations = sorted({str(row.get("ablation", "")) for row in rows if row.get("ablation")})
     comparisons = [
         ("gaze_word_pool_lr", BASELINES["gaze_word_pool_lr_auroc"], BASELINES["gaze_word_pool_lr_macro_f1"]),
         ("eeg_word_pool_lr", BASELINES["eeg_word_pool_lr_auroc"], math.nan),
         ("concat_word_pool_lr", BASELINES["concat_word_pool_lr_auroc"], math.nan),
     ]
-    aurocs = [float(row["test_auroc"]) for row in full_rows]
-    macro_f1s = [float(row["test_macro_f1"]) for row in full_rows]
-    for name, auroc_base, f1_base in comparisons:
-        diff, lo, hi = bootstrap_ci(aurocs, auroc_base)
-        row: dict[str, Any] = {
-            "comparison": "full_vs_%s" % name,
-            "n": len(full_rows),
-            "auroc_baseline": auroc_base,
-            "auroc_diff_mean": diff,
-            "auroc_diff_ci_low": lo,
-            "auroc_diff_ci_high": hi,
-            "auroc_wilcoxon_p": wilcoxon_p(aurocs, auroc_base),
-            "subjects_full_above_baseline": sum(1 for value in aurocs if value > auroc_base),
-            "worst_subject_auroc": min(aurocs) if aurocs else math.nan,
-            "std_across_subjects_auroc": stdev(aurocs) if len(aurocs) > 1 else 0.0,
-        }
-        if not math.isnan(f1_base):
-            f1_diff, f1_lo, f1_hi = bootstrap_ci(macro_f1s, f1_base)
-            row.update(
-                {
-                    "macro_f1_baseline": f1_base,
-                    "macro_f1_diff_mean": f1_diff,
-                    "macro_f1_diff_ci_low": f1_lo,
-                    "macro_f1_diff_ci_high": f1_hi,
-                    "macro_f1_wilcoxon_p": wilcoxon_p(macro_f1s, f1_base),
-                }
-            )
-        out.append(row)
+    for ablation in ablations:
+        ablation_rows = [row for row in rows if row.get("ablation") == ablation]
+        aurocs = [float(row["test_auroc"]) for row in ablation_rows]
+        macro_f1s = [float(row["test_macro_f1"]) for row in ablation_rows]
+        for name, auroc_base, f1_base in comparisons:
+            diff, lo, hi = bootstrap_ci(aurocs, auroc_base)
+            row: dict[str, Any] = {
+                "comparison": "%s_vs_%s" % (ablation, name),
+                "ablation": ablation,
+                "n": len(ablation_rows),
+                "auroc_baseline": auroc_base,
+                "auroc_diff_mean": diff,
+                "auroc_diff_ci_low": lo,
+                "auroc_diff_ci_high": hi,
+                "auroc_wilcoxon_p": wilcoxon_p(aurocs, auroc_base),
+                "subjects_above_baseline": sum(1 for value in aurocs if value > auroc_base),
+                "worst_subject_auroc": min(aurocs) if aurocs else math.nan,
+                "std_across_subjects_auroc": stdev(aurocs) if len(aurocs) > 1 else 0.0,
+            }
+            if not math.isnan(f1_base):
+                f1_diff, f1_lo, f1_hi = bootstrap_ci(macro_f1s, f1_base)
+                row.update(
+                    {
+                        "macro_f1_baseline": f1_base,
+                        "macro_f1_diff_mean": f1_diff,
+                        "macro_f1_diff_ci_low": f1_lo,
+                        "macro_f1_diff_ci_high": f1_hi,
+                        "macro_f1_wilcoxon_p": wilcoxon_p(macro_f1s, f1_base),
+                    }
+                )
+            out.append(row)
     return out
 
 
