@@ -30,6 +30,13 @@ ABLATIONS = [
     "full_cnogsm",
 ]
 
+AION_MODELS = [
+    "aion",
+    "aion_no_manifold",
+    "aion_no_precision",
+    "aion_no_gaze_control",
+]
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -61,6 +68,7 @@ def compute_aux_loss(aux: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         ("bipartite_smooth", "graph_smooth"),
         ("graph_entropy", "graph_entropy"),
         ("bipartite_entropy", "graph_entropy"),
+        ("aion_orth", "unique_decor"),
     ]:
         if key in aux:
             loss = aux[key]
@@ -203,7 +211,7 @@ def main() -> None:
     parser.add_argument("--sequence-jsonl", type=Path, required=True)
     parser.add_argument("--split-json", type=Path, default=Path("reports/adagtcn_aligned/subject_splits.json"))
     parser.add_argument("--protocol", default="Y16_12_2_2_seed0")
-    parser.add_argument("--model", default="full_cnogsm", choices=ABLATIONS + ["all"])
+    parser.add_argument("--model", default="full_cnogsm", choices=ABLATIONS + AION_MODELS + ["all"])
     parser.add_argument("--output-dir", type=Path, default=Path("results/adagtcn_aligned"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-len", type=int, default=80)

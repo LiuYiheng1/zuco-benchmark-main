@@ -238,6 +238,149 @@ class SubjectInvariantBridge(nn.Module):
         return shared_seq, {"subject_logits": subject_logits, "bridge_eeg_recon": eeg_loss, "bridge_gaze_recon": gaze_loss}
 
 
+class OculomotorControlledSSM(nn.Module):
+    def __init__(self, eeg_dim: int, gaze_dim: int, hidden_dim: int, dropout: float, use_gaze_control: bool = True) -> None:
+        super().__init__()
+        self.use_gaze_control = use_gaze_control
+        self.gaze_encoder = nn.Sequential(nn.Linear(gaze_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim))
+        self.eeg_encoder = nn.Sequential(nn.Linear(max(eeg_dim, 1), hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim))
+        self.transition = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.static_transition = nn.Parameter(torch.zeros(hidden_dim * 3))
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, gaze: torch.Tensor, eeg: torch.Tensor, step_mask: torch.Tensor, gaze_mask: torch.Tensor, eeg_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, steps, _ = gaze.shape
+        hidden = self.static_transition.shape[0] // 3
+        z = gaze.new_zeros((bsz, hidden))
+        outputs = []
+        gaze_h = self.gaze_encoder(gaze) * gaze_mask.unsqueeze(-1)
+        eeg_h = self.eeg_encoder(eeg) * eeg_mask.unsqueeze(-1)
+
+        for idx in range(steps):
+            mt = step_mask[:, idx].unsqueeze(-1)
+            if self.use_gaze_control:
+                params = self.transition(gaze_h[:, idx])
+            else:
+                params = self.static_transition.unsqueeze(0).expand(bsz, -1)
+            a_t, b_t, gate_t = params.chunk(3, dim=-1)
+            a_t = torch.tanh(a_t)
+            gate_t = torch.sigmoid(gate_t)
+            candidate = torch.tanh(a_t * z + b_t * eeg_h[:, idx])
+            new_z = gate_t * z + (1.0 - gate_t) * candidate
+            z = mt * new_z + (1.0 - mt) * z
+            outputs.append(z.unsqueeze(1))
+
+        prior = torch.cat(outputs, dim=1)
+        return self.norm(self.dropout(prior)), eeg_h, gaze_h
+
+
+class SubjectInvariantManifoldRectifier(nn.Module):
+    def __init__(self, hidden_dim: int, n_subjects: int, dropout: float) -> None:
+        super().__init__()
+        self.cognitive = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim), nn.Dropout(dropout))
+        self.subject_specific = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim), nn.Dropout(dropout))
+        self.subject_head = nn.Linear(hidden_dim, n_subjects)
+
+    def forward(self, eeg_h: torch.Tensor, mask: torch.Tensor, grl_scale: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        h_c = self.cognitive(eeg_h) * mask.unsqueeze(-1)
+        h_s = self.subject_specific(eeg_h) * mask.unsqueeze(-1)
+        pooled_c = masked_mean(h_c, mask)
+        subject_logits = self.subject_head(grad_reverse(pooled_c, grl_scale))
+
+        denom = mask.sum().clamp_min(1.0)
+        cross = torch.einsum("bth,btd->hd", h_c, h_s) / denom
+        orth_loss = torch.square(cross).mean()
+        aux = {
+            "subject_logits": subject_logits,
+            "aion_orth": orth_loss,
+        }
+        return h_c, aux
+
+
+class PrecisionWeightedFreeEnergyFusion(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float, use_precision: bool = True) -> None:
+        super().__init__()
+        self.use_precision = use_precision
+        self.gaze_precision = nn.Linear(hidden_dim, 1)
+        self.eeg_precision = nn.Linear(hidden_dim, 1)
+        self.residual = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+        nn.init.constant_(self.eeg_precision.bias, -2.0)
+        nn.init.constant_(self.gaze_precision.bias, 1.0)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, z_prior: torch.Tensor, h_c: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.use_precision:
+            tau_g = F.softplus(self.gaze_precision(z_prior))
+            tau_e = F.softplus(self.eeg_precision(h_c))
+            alpha = tau_e / (tau_e + tau_g + 1e-6)
+        else:
+            alpha = torch.full_like(z_prior[..., :1], 0.5)
+        residual = self.residual(h_c - z_prior)
+        z = self.norm(z_prior + alpha * residual) * mask.unsqueeze(-1)
+        valid_alpha = alpha.squeeze(-1) * mask
+        denom = mask.sum().clamp_min(1.0)
+        alpha_mean = valid_alpha.sum() / denom
+        alpha_std = torch.sqrt(torch.square((alpha.squeeze(-1) - alpha_mean) * mask).sum() / denom)
+        return z, {"aion_alpha_mean": alpha_mean.detach(), "aion_alpha_std": alpha_std.detach()}
+
+
+class AION(nn.Module):
+    def __init__(
+        self,
+        eeg_dim: int,
+        gaze_dim: int,
+        n_subjects: int,
+        hidden_dim: int,
+        dropout: float,
+        use_manifold: bool = True,
+        use_precision: bool = True,
+        use_gaze_control: bool = True,
+    ) -> None:
+        super().__init__()
+        self.use_manifold = use_manifold
+        self.state = OculomotorControlledSSM(eeg_dim, gaze_dim, hidden_dim, dropout, use_gaze_control=use_gaze_control)
+        self.manifold = SubjectInvariantManifoldRectifier(hidden_dim, n_subjects, dropout) if use_manifold else None
+        self.eeg_rectifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim), nn.Dropout(dropout))
+        self.fusion = PrecisionWeightedFreeEnergyFusion(hidden_dim, dropout, use_precision=use_precision)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, batch: dict[str, torch.Tensor], grl_scale: float = 1.0) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        eeg = batch["eeg"]
+        gaze = batch["gaze"]
+        step_mask = batch["step_mask"]
+        eeg_mask = batch["eeg_mask"]
+        gaze_mask = batch["gaze_mask"]
+        valid_eeg = (step_mask * eeg_mask).clamp(max=1.0)
+        valid_gaze = (step_mask * gaze_mask).clamp(max=1.0)
+
+        z_prior, eeg_h, _ = self.state(gaze, eeg, step_mask, valid_gaze, valid_eeg)
+        aux: dict[str, torch.Tensor] = {}
+        if self.manifold is not None:
+            h_c, manifold_aux = self.manifold(eeg_h, valid_eeg, grl_scale)
+            aux.update(manifold_aux)
+        else:
+            h_c = self.eeg_rectifier(eeg_h) * valid_eeg.unsqueeze(-1)
+
+        z, fusion_aux = self.fusion(z_prior, h_c, step_mask)
+        aux.update(fusion_aux)
+        pooled = masked_mean(z, step_mask)
+        logits = self.classifier(pooled)
+        return logits, aux
+
+
 @dataclass
 class ModelConfig:
     eeg_dim: int
@@ -252,6 +395,10 @@ class ModelConfig:
     use_bipartite: bool = False
     use_common_unique: bool = False
     use_subject_bridge: bool = False
+    architecture: str = "cnogsm"
+    use_manifold: bool = True
+    use_precision: bool = True
+    use_gaze_control: bool = True
 
 
 class CNOGSM(nn.Module):
@@ -336,7 +483,7 @@ class CNOGSM(nn.Module):
         return logits, aux
 
 
-def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_dim: int, n_eeg_nodes: int, dropout: float) -> CNOGSM:
+def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_dim: int, n_eeg_nodes: int, dropout: float) -> nn.Module:
     presets = {
         "adagtcn_aligned": dict(temporal="tcn", use_eeg=True, use_gaze=True, use_bipartite=False, use_common_unique=False, use_subject_bridge=False),
         "eeg_only_graph_tcn": dict(temporal="tcn", use_eeg=True, use_gaze=False, use_bipartite=False, use_common_unique=False, use_subject_bridge=False),
@@ -346,6 +493,10 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
         "bipartite_graph_ssm": dict(temporal="gaze_ssm", use_eeg=True, use_gaze=True, use_bipartite=True, use_common_unique=False, use_subject_bridge=False),
         "bridge_bipartite_ssm": dict(temporal="gaze_ssm", use_eeg=True, use_gaze=True, use_bipartite=True, use_common_unique=False, use_subject_bridge=True),
         "full_cnogsm": dict(temporal="gaze_ssm", use_eeg=True, use_gaze=True, use_bipartite=True, use_common_unique=True, use_subject_bridge=True),
+        "aion": dict(architecture="aion", use_manifold=True, use_precision=True, use_gaze_control=True),
+        "aion_no_manifold": dict(architecture="aion", use_manifold=False, use_precision=True, use_gaze_control=True),
+        "aion_no_precision": dict(architecture="aion", use_manifold=True, use_precision=False, use_gaze_control=True),
+        "aion_no_gaze_control": dict(architecture="aion", use_manifold=True, use_precision=True, use_gaze_control=False),
     }
     if name not in presets:
         raise ValueError("Unknown model %s. Available: %s" % (name, sorted(presets)))
@@ -358,4 +509,15 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
         dropout=dropout,
         **presets[name],
     )
+    if config.architecture == "aion":
+        return AION(
+            eeg_dim=config.eeg_dim,
+            gaze_dim=config.gaze_dim,
+            n_subjects=config.n_subjects,
+            hidden_dim=config.hidden_dim,
+            dropout=config.dropout,
+            use_manifold=config.use_manifold,
+            use_precision=config.use_precision,
+            use_gaze_control=config.use_gaze_control,
+        )
     return CNOGSM(config)
