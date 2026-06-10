@@ -29,6 +29,20 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
 def to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     out = {}
     for key, value in batch.items():
@@ -209,7 +223,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     write_rows_csv(test_predictions, preds_path)
     write_rows_csv(history, history_path)
     meta_dump = {
-        "args": vars(args),
+        "args": json_safe(vars(args)),
         "split": {
             "protocol": split.protocol,
             "train": split.train,
@@ -217,7 +231,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "test": split.test,
             "note": split.note,
         },
-        "dataset": meta,
+        "dataset": json_safe(meta),
         "best_checkpoint": str(best_path),
     }
     meta_path.write_text(json.dumps(meta_dump, indent=2), encoding="utf-8")
