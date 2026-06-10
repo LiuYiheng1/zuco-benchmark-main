@@ -302,12 +302,13 @@ def extract_file(mat_path: Path, out_f: Any, preview: list[str]) -> dict[str, An
 
             sentence_content = matlab_string(file, mat_index(sentence_data["content"], sent_idx)) if "content" in sentence_data else ""
             omission_rate = read_omission_rate(file, sentence_data, sent_idx)
-            sequence_id = f"{subject}_{task}_{sent_idx:04d}"
+            sequence_id = f"{subject}_{task}_{sent_idx}"
             record = {
                 "sequence_id": sequence_id,
                 "subject": subject,
                 "task": task,
                 "label": label,
+                "y": int(label),
                 "sentence_id": sent_idx,
                 "sentence_content": sentence_content,
                 "n_words": n_words,
