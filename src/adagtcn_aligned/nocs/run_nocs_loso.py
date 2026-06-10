@@ -63,7 +63,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run NOCS LOSO jobs, one process per GPU.")
     parser.add_argument("--sequence-jsonl", type=Path, default=Path("data/adagtcn_aligned/zuco_word_band_gaze_sequences.jsonl"))
     parser.add_argument("--split-json", type=Path, default=Path("reports/adagtcn_aligned/subject_splits.json"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/nocs"))
+    parser.add_argument("--output-dir", "--output_dir", type=Path, default=Path("outputs/nocs"))
     parser.add_argument("--seeds", nargs="+", type=int, default=[1])
     parser.add_argument("--gpus", default="")
     parser.add_argument("--device", default="cuda")

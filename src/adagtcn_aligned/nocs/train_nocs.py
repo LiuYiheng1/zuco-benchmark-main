@@ -253,7 +253,7 @@ def main() -> None:
     parser.add_argument("--protocol", default="Y16_LOSO_YAC")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/nocs"))
+    parser.add_argument("--output-dir", "--output_dir", type=Path, default=Path("outputs/nocs"))
     parser.add_argument("--ablation", choices=ABLATIONS, default="full")
     parser.add_argument("--max-len", type=int, default=80)
     parser.add_argument("--d-model", type=int, default=128)
