@@ -18,7 +18,7 @@ from src.adagtcn_aligned.nocs.losses_nocs import nocs_loss
 from src.adagtcn_aligned.nocs.model_nocs import NOCSModel
 
 
-ABLATIONS = ["full", "no_eeg", "no_gaze_control", "no_uncertainty", "no_adv", "gaze_only", "eeg_only"]
+ABLATIONS = ["full", "residual", "no_eeg", "no_gaze_control", "no_uncertainty", "no_adv", "gaze_only", "eeg_only"]
 
 
 def set_seed(seed: int) -> None:
@@ -137,6 +137,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         dropout=args.dropout,
         bidirectional=not args.causal,
         ablation=args.ablation,
+        residual_beta=args.residual_beta,
     ).to(device)
 
     weights = None
@@ -168,6 +169,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.lambda_adv,
                 args.lambda_uncert,
                 args.lambda_supcon,
+                args.lambda_residual_norm,
+                args.lambda_gate,
                 args.mono_margin,
                 args.uncert_margin,
             )
@@ -266,8 +269,11 @@ def main() -> None:
     parser.add_argument("--lambda-adv", type=float, default=0.1)
     parser.add_argument("--lambda-uncert", type=float, default=0.1)
     parser.add_argument("--lambda-supcon", type=float, default=0.05)
+    parser.add_argument("--lambda-residual-norm", type=float, default=0.05)
+    parser.add_argument("--lambda-gate", type=float, default=0.01)
     parser.add_argument("--mono-margin", type=float, default=0.02)
     parser.add_argument("--uncert-margin", type=float, default=0.0)
+    parser.add_argument("--residual-beta", type=float, default=0.3)
     parser.add_argument("--class-weight", choices=["balanced", "none"], default="balanced")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--cache-records", action="store_true")

@@ -161,9 +161,11 @@ class NOCSModel(nn.Module):
         dropout: float = 0.3,
         bidirectional: bool = True,
         ablation: str = "full",
+        residual_beta: float = 0.3,
     ) -> None:
         super().__init__()
         self.ablation = ablation
+        self.residual_beta = residual_beta
         self.gaze_branch = GazeBranch(gaze_dim, d_model, hidden_dim, dropout)
         self.eeg_branch = EEGBranch(eeg_dim, d_model, hidden_dim, dropout)
         self.controlled_state = GazeControlledState(eeg_dim, gaze_dim, hidden_dim, dropout, bidirectional)
@@ -173,6 +175,19 @@ class NOCSModel(nn.Module):
         self.logvar_e = nn.Linear(hidden_dim, 1)
         self.logvar_c = nn.Linear(hidden_dim, 1)
         self.full_classifier = nn.Linear(hidden_dim, 2)
+        residual_dim = hidden_dim * 3
+        self.residual_head = nn.Sequential(
+            nn.Linear(residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.residual_gate = nn.Sequential(
+            nn.Linear(residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
         self.subject_classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -235,7 +250,15 @@ class NOCSModel(nn.Module):
             z_c = F.gelu(self.c_to_hidden(z_c_raw))
 
         z_full, uncertainty = self._fusion(z_g, z_e, z_c)
-        if self.ablation == "gaze_only":
+        residual_in = torch.cat([z_e, z_c, z_g], dim=-1)
+        delta_logits_eeg = self.residual_head(residual_in)
+        residual_gate = torch.sigmoid(self.residual_gate(residual_in))
+        residual_correction = self.residual_beta * residual_gate * delta_logits_eeg
+
+        if self.ablation == "residual":
+            logits_full = logits_g + residual_correction
+            z_full = z_g
+        elif self.ablation == "gaze_only":
             logits_full = logits_g
             z_full = z_g
         elif self.ablation == "eeg_only":
@@ -255,6 +278,9 @@ class NOCSModel(nn.Module):
             "z_e": z_e,
             "z_c": z_c,
             "gate": gates,
+            "delta_logits_eeg": delta_logits_eeg,
+            "residual_gate": residual_gate,
+            "residual_correction": residual_correction,
             "subject_logits": subject_logits,
         }
         out.update(uncertainty)

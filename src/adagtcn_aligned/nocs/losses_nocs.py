@@ -13,6 +13,8 @@ def branch_weights(ablation: str) -> dict[str, float]:
         return {"g": 0.0, "e": 0.3, "c": 0.0}
     if ablation == "no_eeg":
         return {"g": 0.5, "e": 0.0, "c": 0.5}
+    if ablation == "residual":
+        return {"g": 0.5, "e": 0.3, "c": 0.0}
     return {"g": 0.5, "e": 0.3, "c": 0.5}
 
 
@@ -54,6 +56,8 @@ def nocs_loss(
     lambda_adv: float,
     lambda_uncert: float,
     lambda_supcon: float,
+    lambda_residual_norm: float,
+    lambda_gate: float,
     mono_margin: float,
     uncert_margin: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -80,12 +84,20 @@ def nocs_loss(
         uncert = uncert * 0.0
 
     supcon = supervised_contrastive_loss(outputs["z_full"], labels, subjects)
+    residual_norm = outputs["residual_correction"].pow(2).sum(dim=-1).mean()
+    gate_penalty = outputs["residual_gate"].mean()
+    if ablation != "residual":
+        residual_norm = residual_norm * 0.0
+        gate_penalty = gate_penalty * 0.0
+
     total = (
         cls_loss
         + lambda_mono * mono_loss
         + lambda_adv * subject_adv
         + lambda_uncert * uncert
         + lambda_supcon * supcon
+        + lambda_residual_norm * residual_norm
+        + lambda_gate * gate_penalty
     )
     logs = {
         "loss": float(total.detach().cpu()),
@@ -94,9 +106,13 @@ def nocs_loss(
         "subject_adv_loss": float(subject_adv.detach().cpu()),
         "uncertainty_penalty": float(uncert.detach().cpu()),
         "supcon_loss": float(supcon.detach().cpu()),
+        "residual_norm_penalty": float(residual_norm.detach().cpu()),
+        "residual_gate_penalty": float(gate_penalty.detach().cpu()),
         "precision_g": float(outputs["precision_g"].detach().mean().cpu()),
         "precision_e": float(outputs["precision_e"].detach().mean().cpu()),
         "precision_c": float(outputs["precision_c"].detach().mean().cpu()),
         "gate_mean": float(outputs["gate"].detach().mean().cpu()),
+        "residual_gate_mean": float(outputs["residual_gate"].detach().mean().cpu()),
+        "residual_correction_norm": float(outputs["residual_correction"].detach().norm(dim=-1).mean().cpu()),
     }
     return total, logs
