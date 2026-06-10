@@ -16,6 +16,7 @@ RUN_TAG="${RUN_TAG:-valfix_v1}"
 GPUS_CSV="${GPUS:-0,1,2,3,4,5,6,7,8}"
 
 SPLIT_JSON="${SPLIT_JSON:-reports/adagtcn_aligned/subject_splits.json}"
+SEQUENCE_JSONL_OVERRIDE="${SEQUENCE_JSONL:-}"
 PILOT_SEQUENCE_JSONL="${PILOT_SEQUENCE_JSONL:-data/adagtcn_aligned/pilot_y16_60sent_band_vectors_sequences.jsonl}"
 FULL_SEQUENCE_JSONL="${FULL_SEQUENCE_JSONL:-data/adagtcn_aligned/paper_y16_full_band_vectors_sequences.jsonl}"
 
@@ -75,6 +76,10 @@ case "$RUN_MODE" in
         exit 1
         ;;
 esac
+
+if [[ -n "$SEQUENCE_JSONL_OVERRIDE" ]]; then
+    SEQUENCE_JSONL="$SEQUENCE_JSONL_OVERRIDE"
+fi
 
 if [[ ! -f "$SEQUENCE_JSONL" ]]; then
     echo "Sequence JSONL not found: $SEQUENCE_JSONL" >&2
