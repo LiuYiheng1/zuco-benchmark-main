@@ -33,6 +33,8 @@ ABLATIONS = [
 AION_MODELS = [
     "aion",
     "aion_v2",
+    "aion_v3",
+    "aion_v3_gaze_only",
     "aion_no_manifold",
     "aion_no_precision",
     "aion_no_gaze_control",

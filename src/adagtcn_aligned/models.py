@@ -451,6 +451,92 @@ class AIONV2(nn.Module):
         return logits, aux
 
 
+class GazeOnlyPriorExpert(nn.Module):
+    def __init__(self, gaze_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.gaze_encoder = nn.Sequential(
+            nn.Linear(gaze_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.fusion = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim))
+        self.temporal = GazeControlledStateSpace(hidden_dim, gaze_dim, dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, gaze: torch.Tensor, step_mask: torch.Tensor, gaze_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gaze_h = self.gaze_encoder(gaze)
+        zero_eeg_h = torch.zeros_like(gaze_h)
+        fusion_h = self.fusion(torch.cat([zero_eeg_h, gaze_h], dim=-1))
+        seq_h = self.temporal(fusion_h, step_mask, gaze)
+        pooled = masked_mean(seq_h, step_mask)
+        logits = self.classifier(pooled)
+        return logits, pooled
+
+
+class AIONV3(nn.Module):
+    def __init__(
+        self,
+        eeg_dim: int,
+        gaze_dim: int,
+        hidden_dim: int,
+        n_eeg_nodes: int,
+        dropout: float,
+        use_eeg_residual: bool = True,
+    ) -> None:
+        super().__init__()
+        self.use_eeg_residual = use_eeg_residual
+        self.gaze_prior = GazeOnlyPriorExpert(gaze_dim, hidden_dim, dropout)
+        self.eeg_encoder = EEGGraphEncoder(eeg_dim, hidden_dim, n_eeg_nodes, dropout)
+        self.eeg_residual = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+        nn.init.zeros_(self.eeg_residual[-1].weight)
+        nn.init.zeros_(self.eeg_residual[-1].bias)
+        self.precision_gate = nn.Linear(hidden_dim * 3, 1)
+        nn.init.constant_(self.precision_gate.bias, -3.0)
+
+    def forward(self, batch: dict[str, torch.Tensor], grl_scale: float = 1.0) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        eeg = batch["eeg"]
+        gaze = batch["gaze"]
+        step_mask = batch["step_mask"]
+        eeg_mask = batch["eeg_mask"]
+        gaze_mask = batch["gaze_mask"]
+
+        logits_g, h_g = self.gaze_prior(gaze, step_mask, gaze_mask)
+        h_e_seq, _, eeg_aux = self.eeg_encoder(eeg)
+        h_e_seq = h_e_seq * (step_mask * eeg_mask).clamp(max=1.0).unsqueeze(-1)
+        h_e = masked_mean(h_e_seq, (step_mask * eeg_mask).clamp(max=1.0))
+
+        if self.use_eeg_residual:
+            delta_logits = self.eeg_residual(h_e)
+            gate_input = torch.cat([h_g, h_e, torch.abs(h_g - h_e)], dim=-1)
+            alpha = torch.sigmoid(self.precision_gate(gate_input))
+            logits = logits_g + alpha * delta_logits
+        else:
+            delta_logits = torch.zeros_like(logits_g)
+            alpha = torch.zeros_like(logits_g[:, :1])
+            logits = logits_g
+
+        aux = {
+            "aion_v3_alpha_mean": alpha.mean().detach(),
+            "aion_v3_alpha_std": alpha.std(unbiased=False).detach(),
+            "aion_v3_delta_logit_norm": delta_logits.norm(dim=-1).mean().detach(),
+            "aion_v3_logits_g_norm": logits_g.norm(dim=-1).mean().detach(),
+            "aion_v3_logits_final_norm": logits.norm(dim=-1).mean().detach(),
+        }
+        aux.update(eeg_aux)
+        return logits, aux
+
+
 @dataclass
 class ModelConfig:
     eeg_dim: int
@@ -568,6 +654,8 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
         "aion_no_precision": dict(architecture="aion", use_manifold=True, use_precision=False, use_gaze_control=True),
         "aion_no_gaze_control": dict(architecture="aion", use_manifold=True, use_precision=True, use_gaze_control=False),
         "aion_v2": dict(architecture="aion_v2"),
+        "aion_v3": dict(architecture="aion_v3"),
+        "aion_v3_gaze_only": dict(architecture="aion_v3_gaze_only"),
     }
     if name not in presets:
         raise ValueError("Unknown model %s. Available: %s" % (name, sorted(presets)))
@@ -598,5 +686,14 @@ def build_model(name: str, eeg_dim: int, gaze_dim: int, n_subjects: int, hidden_
             hidden_dim=config.hidden_dim,
             n_eeg_nodes=config.n_eeg_nodes,
             dropout=config.dropout,
+        )
+    if config.architecture in {"aion_v3", "aion_v3_gaze_only"}:
+        return AIONV3(
+            eeg_dim=config.eeg_dim,
+            gaze_dim=config.gaze_dim,
+            hidden_dim=config.hidden_dim,
+            n_eeg_nodes=config.n_eeg_nodes,
+            dropout=config.dropout,
+            use_eeg_residual=config.architecture == "aion_v3",
         )
     return CNOGSM(config)
