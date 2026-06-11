@@ -46,6 +46,12 @@ def uncertainty_penalty(outputs: dict[str, torch.Tensor], margin: float) -> torc
     return torch.relu(precision_e - precision_g - margin).mean()
 
 
+def residual_penalties(outputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    residual_norm = outputs["residual_correction"].pow(2).sum(dim=-1).mean()
+    gate_penalty = outputs["residual_gate"].mean()
+    return residual_norm, gate_penalty
+
+
 def nocs_loss(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
@@ -61,7 +67,56 @@ def nocs_loss(
     mono_margin: float,
     uncert_margin: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if ablation == "stat_gaze":
+        ce_stat = F.cross_entropy(outputs["logits_stat"], labels, weight=class_weights)
+        logs = {
+            "loss": float(ce_stat.detach().cpu()),
+            "cls_loss": float(ce_stat.detach().cpu()),
+            "stat_loss": float(ce_stat.detach().cpu()),
+            "mono_loss": 0.0,
+            "subject_adv_loss": 0.0,
+            "uncertainty_penalty": 0.0,
+            "supcon_loss": 0.0,
+            "residual_norm_penalty": 0.0,
+            "residual_gate_penalty": 0.0,
+            "precision_g": 0.0,
+            "precision_e": 0.0,
+            "precision_c": 0.0,
+            "gate_mean": 0.0,
+            "residual_gate_mean": 0.0,
+            "residual_correction_norm": 0.0,
+        }
+        return ce_stat, logs
+
     ce_full = F.cross_entropy(outputs["logits_full"], labels, weight=class_weights, reduction="none")
+    if ablation in {"stat_residual", "stat_full"}:
+        ce_stat = F.cross_entropy(outputs["logits_stat"], labels, weight=class_weights, reduction="none")
+        ce_e = F.cross_entropy(outputs["logits_e"], labels, weight=class_weights, reduction="none")
+        cls_loss = ce_full.mean() + 0.5 * ce_stat.mean() + 0.3 * ce_e.mean()
+        if ablation == "stat_full":
+            ce_g = F.cross_entropy(outputs["logits_g"], labels, weight=class_weights, reduction="none")
+            cls_loss = cls_loss + 0.3 * ce_g.mean()
+        residual_norm, gate_penalty = residual_penalties(outputs)
+        total = cls_loss + lambda_residual_norm * residual_norm + lambda_gate * gate_penalty
+        logs = {
+            "loss": float(total.detach().cpu()),
+            "cls_loss": float(cls_loss.detach().cpu()),
+            "stat_loss": float(ce_stat.mean().detach().cpu()),
+            "mono_loss": 0.0,
+            "subject_adv_loss": 0.0,
+            "uncertainty_penalty": 0.0,
+            "supcon_loss": 0.0,
+            "residual_norm_penalty": float(residual_norm.detach().cpu()),
+            "residual_gate_penalty": float(gate_penalty.detach().cpu()),
+            "precision_g": float(outputs["precision_g"].detach().mean().cpu()),
+            "precision_e": float(outputs["precision_e"].detach().mean().cpu()),
+            "precision_c": float(outputs["precision_c"].detach().mean().cpu()),
+            "gate_mean": float(outputs["gate"].detach().mean().cpu()),
+            "residual_gate_mean": float(outputs["residual_gate"].detach().mean().cpu()),
+            "residual_correction_norm": float(outputs["residual_correction"].detach().norm(dim=-1).mean().cpu()),
+        }
+        return total, logs
+
     ce_g = F.cross_entropy(outputs["logits_g"], labels, weight=class_weights, reduction="none")
     ce_e = F.cross_entropy(outputs["logits_e"], labels, weight=class_weights, reduction="none")
     ce_c = F.cross_entropy(outputs["logits_c"], labels, weight=class_weights, reduction="none")
@@ -84,8 +139,7 @@ def nocs_loss(
         uncert = uncert * 0.0
 
     supcon = supervised_contrastive_loss(outputs["z_full"], labels, subjects)
-    residual_norm = outputs["residual_correction"].pow(2).sum(dim=-1).mean()
-    gate_penalty = outputs["residual_gate"].mean()
+    residual_norm, gate_penalty = residual_penalties(outputs)
     if ablation != "residual":
         residual_norm = residual_norm * 0.0
         gate_penalty = gate_penalty * 0.0

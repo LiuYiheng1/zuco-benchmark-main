@@ -30,6 +30,20 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (x * mask_f).sum(dim=1) / denom
 
 
+def gaze_stat_pool(gaze: torch.Tensor, valid_mask: torch.Tensor, gaze_mask: torch.Tensor) -> torch.Tensor:
+    mask_f = gaze_mask.float().unsqueeze(-1)
+    valid_count = mask_f.sum(dim=1)
+    sequence_length = valid_mask.float().sum(dim=1, keepdim=True)
+    denom = valid_count.clamp_min(1.0)
+    mean = (gaze * mask_f).sum(dim=1) / denom
+    centered = (gaze - mean.unsqueeze(1)) * mask_f
+    var = centered.pow(2).sum(dim=1) / denom
+    std = torch.sqrt(var.clamp_min(0.0))
+    std = torch.where(valid_count > 1.0, std, torch.zeros_like(std))
+    valid_ratio = valid_count / sequence_length.clamp_min(1.0)
+    return torch.cat([mean, std, valid_ratio, sequence_length, valid_count], dim=-1)
+
+
 class MaskedMLPEncoder(nn.Module):
     def __init__(self, input_dim: int, d_model: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -59,6 +73,41 @@ class GazeBranch(nn.Module):
     def forward(self, gaze: torch.Tensor, gaze_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         z, tokens = self.encoder(gaze, gaze_mask)
         return z, tokens, self.classifier(z)
+
+
+class GazeStatBranch(nn.Module):
+    def __init__(self, gaze_dim: int, hidden_dim: int, dropout: float, stat_head: str = "linear") -> None:
+        super().__init__()
+        self.feature_dim = 2 * gaze_dim + 3
+        self.norm = nn.LayerNorm(self.feature_dim)
+        self.repr = nn.Sequential(
+            nn.Linear(self.feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        if stat_head == "linear":
+            self.classifier = nn.Linear(self.feature_dim, 2)
+        elif stat_head == "mlp":
+            self.classifier = nn.Sequential(
+                nn.Linear(self.feature_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 2),
+            )
+        else:
+            raise ValueError("Unsupported stat_head: %s" % stat_head)
+
+    def forward(
+        self,
+        gaze: torch.Tensor,
+        valid_mask: torch.Tensor,
+        gaze_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = gaze_stat_pool(gaze, valid_mask, gaze_mask)
+        normed = self.norm(features)
+        z = self.repr(normed)
+        logits = self.classifier(normed)
+        return z, features, logits
 
 
 class EEGBranch(nn.Module):
@@ -162,11 +211,14 @@ class NOCSModel(nn.Module):
         bidirectional: bool = True,
         ablation: str = "full",
         residual_beta: float = 0.3,
+        stat_head: str = "linear",
     ) -> None:
         super().__init__()
         self.ablation = ablation
         self.residual_beta = residual_beta
+        self.n_subjects = n_subjects
         self.gaze_branch = GazeBranch(gaze_dim, d_model, hidden_dim, dropout)
+        self.gaze_stat_branch = GazeStatBranch(gaze_dim, hidden_dim, dropout, stat_head)
         self.eeg_branch = EEGBranch(eeg_dim, d_model, hidden_dim, dropout)
         self.controlled_state = GazeControlledState(eeg_dim, gaze_dim, hidden_dim, dropout, bidirectional)
         c_dim = hidden_dim * (2 if bidirectional else 1)
@@ -184,6 +236,32 @@ class NOCSModel(nn.Module):
         )
         self.residual_gate = nn.Sequential(
             nn.Linear(residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        stat_residual_dim = hidden_dim * 3
+        self.stat_residual_head = nn.Sequential(
+            nn.Linear(stat_residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.stat_residual_gate = nn.Sequential(
+            nn.Linear(stat_residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        stat_full_dim = hidden_dim * 4
+        self.stat_full_residual_head = nn.Sequential(
+            nn.Linear(stat_full_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.stat_full_residual_gate = nn.Sequential(
+            nn.Linear(stat_full_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -239,7 +317,31 @@ class NOCSModel(nn.Module):
         eeg_mask = valid_mask & (~batch["eeg_missing"].bool())
         gaze_mask = valid_mask & (~batch["gaze_missing"].bool())
 
-        z_g, _, logits_g = self.gaze_branch(gaze, gaze_mask)
+        if self.ablation == "stat_gaze":
+            z_stat, gaze_stat_feat, logits_stat = self.gaze_stat_branch(gaze, valid_mask, gaze_mask)
+            zeros_one = logits_stat.new_zeros(logits_stat.shape[0], 1)
+            zeros_gate = valid_mask.float().new_zeros(valid_mask.shape)
+            return {
+                "logits_full": logits_stat,
+                "logits_stat": logits_stat,
+                "z_full": z_stat,
+                "z_stat": z_stat,
+                "gaze_stat_feat": gaze_stat_feat,
+                "gate": zeros_gate,
+                "delta_logits_eeg": torch.zeros_like(logits_stat),
+                "residual_gate": zeros_one,
+                "residual_correction": torch.zeros_like(logits_stat),
+                "subject_logits": logits_stat.new_zeros(logits_stat.shape[0], self.n_subjects),
+                "precision_g": zeros_one,
+                "precision_e": zeros_one,
+                "precision_c": zeros_one,
+            }
+
+        if self.ablation == "stat_residual":
+            z_g = gaze.new_zeros(gaze.shape[0], self.full_classifier.in_features)
+            logits_g = gaze.new_zeros(gaze.shape[0], 2)
+        else:
+            z_g, _, logits_g = self.gaze_branch(gaze, gaze_mask)
         z_e, _, logits_e = self.eeg_branch(eeg, eeg_mask)
         if self.ablation == "no_gaze_control":
             z_c = 0.5 * (z_g + z_e)
@@ -248,6 +350,51 @@ class NOCSModel(nn.Module):
         else:
             z_c_raw, gates, logits_c = self.controlled_state(eeg, gaze, valid_mask, eeg_mask, gaze_mask)
             z_c = F.gelu(self.c_to_hidden(z_c_raw))
+
+        if self.ablation in {"stat_residual", "stat_full"}:
+            z_stat, gaze_stat_feat, logits_stat = self.gaze_stat_branch(gaze, valid_mask, gaze_mask)
+            if self.ablation == "stat_residual":
+                residual_in = torch.cat([z_e, z_c, z_stat], dim=-1)
+                delta_logits_eeg = self.stat_residual_head(residual_in)
+                residual_gate = torch.sigmoid(self.stat_residual_gate(residual_in))
+            else:
+                residual_in = torch.cat([z_stat, z_g, z_e, z_c], dim=-1)
+                delta_logits_eeg = self.stat_full_residual_head(residual_in)
+                residual_gate = torch.sigmoid(self.stat_full_residual_gate(residual_in))
+            residual_correction = self.residual_beta * residual_gate * delta_logits_eeg
+            z_full = z_stat
+            logits_full = logits_stat + residual_correction
+            subject_logits = self.subject_classifier(gradient_reverse(z_full, grl_scale))
+            out = {
+                "logits_full": logits_full,
+                "logits_stat": logits_stat,
+                "logits_e": logits_e,
+                "logits_c": logits_c,
+                "z_full": z_full,
+                "z_stat": z_stat,
+                "z_e": z_e,
+                "z_c": z_c,
+                "gaze_stat_feat": gaze_stat_feat,
+                "gate": gates,
+                "delta_logits_eeg": delta_logits_eeg,
+                "residual_gate": residual_gate,
+                "residual_correction": residual_correction,
+                "subject_logits": subject_logits,
+            }
+            if self.ablation == "stat_full":
+                out["logits_g"] = logits_g
+                out["z_g"] = z_g
+            out.update(
+                {
+                    "logvar_g": torch.zeros_like(residual_gate),
+                    "logvar_e": torch.zeros_like(residual_gate),
+                    "logvar_c": torch.zeros_like(residual_gate),
+                    "precision_g": torch.ones_like(residual_gate),
+                    "precision_e": torch.ones_like(residual_gate),
+                    "precision_c": torch.ones_like(residual_gate),
+                }
+            )
+            return out
 
         z_full, uncertainty = self._fusion(z_g, z_e, z_c)
         residual_in = torch.cat([z_e, z_c, z_g], dim=-1)

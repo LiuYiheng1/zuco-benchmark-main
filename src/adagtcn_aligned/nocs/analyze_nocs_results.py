@@ -18,6 +18,12 @@ BASELINES = {
     "gaze_word_pool_lr_macro_f1": 0.5739,
     "eeg_word_pool_lr_auroc": 0.5243,
     "concat_word_pool_lr_auroc": 0.5369,
+    "nocs_full_auroc": 0.6922,
+    "nocs_full_macro_f1": 0.5458,
+    "nocs_gaze_only_auroc": 0.5892,
+    "nocs_gaze_only_macro_f1": 0.5134,
+    "nocs_residual_auroc": 0.6300,
+    "nocs_residual_macro_f1": 0.4967,
 }
 
 
@@ -45,7 +51,19 @@ def aggregate(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     for row in rows:
         grouped[str(row.get(key, ""))].append(row)
     out = []
-    metrics = ["test_accuracy", "test_macro_f1", "test_balanced_accuracy", "test_auroc", "test_auprc"]
+    metrics = [
+        "test_accuracy",
+        "test_macro_f1",
+        "test_balanced_accuracy",
+        "test_auroc",
+        "test_auprc",
+        "stat_auroc",
+        "stat_macro_f1",
+        "full_minus_stat_auroc",
+        "full_minus_stat_macro_f1",
+        "mean_residual_gate",
+        "mean_residual_norm",
+    ]
     for group, items in sorted(grouped.items()):
         row: dict[str, Any] = {key: group, "n_runs": len(items)}
         for metric in metrics:
@@ -86,6 +104,9 @@ def paired_stats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ("gaze_word_pool_lr", BASELINES["gaze_word_pool_lr_auroc"], BASELINES["gaze_word_pool_lr_macro_f1"]),
         ("eeg_word_pool_lr", BASELINES["eeg_word_pool_lr_auroc"], math.nan),
         ("concat_word_pool_lr", BASELINES["concat_word_pool_lr_auroc"], math.nan),
+        ("nocs_full", BASELINES["nocs_full_auroc"], BASELINES["nocs_full_macro_f1"]),
+        ("nocs_gaze_only", BASELINES["nocs_gaze_only_auroc"], BASELINES["nocs_gaze_only_macro_f1"]),
+        ("nocs_residual", BASELINES["nocs_residual_auroc"], BASELINES["nocs_residual_macro_f1"]),
     ]
     for ablation in ablations:
         ablation_rows = [row for row in rows if row.get("ablation") == ablation]
@@ -118,6 +139,42 @@ def paired_stats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     }
                 )
             out.append(row)
+        stat_aurocs = [float(row["stat_auroc"]) for row in ablation_rows if row.get("stat_auroc") not in {None, ""}]
+        stat_macro_f1s = [float(row["stat_macro_f1"]) for row in ablation_rows if row.get("stat_macro_f1") not in {None, ""}]
+        if len(stat_aurocs) == len(ablation_rows) and stat_aurocs:
+            diffs = [float(row["test_auroc"]) - float(row["stat_auroc"]) for row in ablation_rows]
+            f1_diffs = [float(row["test_macro_f1"]) - float(row["stat_macro_f1"]) for row in ablation_rows]
+            out.append(
+                {
+                    "comparison": "%s_full_logits_vs_stat_branch" % ablation,
+                    "ablation": ablation,
+                    "n": len(ablation_rows),
+                    "auroc_diff_mean": mean(diffs),
+                    "auroc_diff_ci_low": float(np.percentile(diffs, 2.5)),
+                    "auroc_diff_ci_high": float(np.percentile(diffs, 97.5)),
+                    "subjects_above_baseline": sum(1 for value in diffs if value > 0),
+                    "macro_f1_diff_mean": mean(f1_diffs),
+                }
+            )
+            diff, lo, hi = bootstrap_ci(stat_aurocs, BASELINES["gaze_word_pool_lr_auroc"])
+            f1_diff, f1_lo, f1_hi = bootstrap_ci(stat_macro_f1s, BASELINES["gaze_word_pool_lr_macro_f1"])
+            out.append(
+                {
+                    "comparison": "%s_stat_branch_vs_gaze_word_pool_lr" % ablation,
+                    "ablation": ablation,
+                    "n": len(ablation_rows),
+                    "auroc_baseline": BASELINES["gaze_word_pool_lr_auroc"],
+                    "auroc_diff_mean": diff,
+                    "auroc_diff_ci_low": lo,
+                    "auroc_diff_ci_high": hi,
+                    "subjects_above_baseline": sum(1 for value in stat_aurocs if value > BASELINES["gaze_word_pool_lr_auroc"]),
+                    "macro_f1_baseline": BASELINES["gaze_word_pool_lr_macro_f1"],
+                    "macro_f1_diff_mean": f1_diff,
+                    "macro_f1_diff_ci_low": f1_lo,
+                    "macro_f1_diff_ci_high": f1_hi,
+                    "macro_f1_wilcoxon_p": wilcoxon_p(stat_macro_f1s, BASELINES["gaze_word_pool_lr_macro_f1"]),
+                }
+            )
     return out
 
 

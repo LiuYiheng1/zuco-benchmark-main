@@ -53,6 +53,14 @@ def build_command(args: argparse.Namespace, protocol: str, seed: int, device: st
         str(args.batch_size),
         "--max-len",
         str(args.max_len),
+        "--stat-head",
+        args.stat_head,
+        "--residual-beta",
+        str(args.residual_beta),
+        "--lambda-residual-norm",
+        str(args.lambda_residual_norm),
+        "--lambda-gate",
+        str(args.lambda_gate),
     ]
     if args.cache_records:
         cmd.append("--cache-records")
@@ -72,6 +80,10 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-len", type=int, default=80)
+    parser.add_argument("--stat-head", "--stat_head", choices=["linear", "mlp"], default="linear")
+    parser.add_argument("--residual-beta", "--residual_beta", type=float, default=0.3)
+    parser.add_argument("--lambda-residual-norm", "--lambda_residual_norm", type=float, default=0.01)
+    parser.add_argument("--lambda-gate", "--lambda_gate", type=float, default=0.001)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--protocols", nargs="*", default=None)
     parser.add_argument("--cache-records", action="store_true")
