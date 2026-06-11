@@ -23,6 +23,7 @@ GAZE_LR_MACRO_F1 = 0.5739
 NAIVE_CONCAT_AUROC = 0.5369
 NOCS_FULL_AUROC = 0.6922
 SAFENOCS_WORST_AUROC = 0.3594959958856807
+_CERT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 @dataclass
@@ -104,34 +105,46 @@ def utility_certificate(
     n_boot: int,
     seed: int,
 ) -> dict[str, Any]:
-    y = val["y_true"].to_numpy(dtype=np.int64)
-    anchor = val["y_prob_anchor"].to_numpy(dtype=np.float64)
-    corrected = val["y_prob_corrected"].to_numpy(dtype=np.float64)
-    anchor_metrics = binary_metrics(y, anchor)
-    corrected_metrics = binary_metrics(y, corrected)
-    delta, ci_low, ci_high = bootstrap_delta_ci(y, anchor, corrected, n_boot=n_boot, seed=seed)
-    macro_delta = corrected_metrics["macro_f1"] - anchor_metrics["macro_f1"]
-    bal_delta = corrected_metrics["balanced_accuracy"] - anchor_metrics["balanced_accuracy"]
-    passed = (
-        delta > 0.0
-        and ci_low >= -epsilon
-        and corrected_metrics["macro_f1"] >= anchor_metrics["macro_f1"] - 0.005
-        and corrected_metrics["balanced_accuracy"] >= anchor_metrics["balanced_accuracy"] - 0.005
+    cache_key = (
+        tuple(val["protocol"].astype(str).tolist()),
+        tuple(val["sequence_id"].astype(str).tolist()),
+        n_boot,
+        seed,
     )
-    return {
-        "anchor_val_auroc": anchor_metrics["auroc"],
-        "corrected_val_auroc": corrected_metrics["auroc"],
-        "delta_val": delta,
-        "delta_ci_low": ci_low,
-        "delta_ci_high": ci_high,
-        "anchor_val_macro_f1": anchor_metrics["macro_f1"],
-        "corrected_val_macro_f1": corrected_metrics["macro_f1"],
-        "delta_val_macro_f1": macro_delta,
-        "anchor_val_balanced_accuracy": anchor_metrics["balanced_accuracy"],
-        "corrected_val_balanced_accuracy": corrected_metrics["balanced_accuracy"],
-        "delta_val_balanced_accuracy": bal_delta,
-        "certificate_passed": bool(passed),
-    }
+    if cache_key in _CERT_CACHE:
+        base = dict(_CERT_CACHE[cache_key])
+    else:
+        y = val["y_true"].to_numpy(dtype=np.int64)
+        anchor = val["y_prob_anchor"].to_numpy(dtype=np.float64)
+        corrected = val["y_prob_corrected"].to_numpy(dtype=np.float64)
+        anchor_metrics = binary_metrics(y, anchor)
+        corrected_metrics = binary_metrics(y, corrected)
+        delta, ci_low, ci_high = bootstrap_delta_ci(y, anchor, corrected, n_boot=n_boot, seed=seed)
+        macro_delta = corrected_metrics["macro_f1"] - anchor_metrics["macro_f1"]
+        bal_delta = corrected_metrics["balanced_accuracy"] - anchor_metrics["balanced_accuracy"]
+        base = {
+            "anchor_val_auroc": anchor_metrics["auroc"],
+            "corrected_val_auroc": corrected_metrics["auroc"],
+            "delta_val": delta,
+            "delta_ci_low": ci_low,
+            "delta_ci_high": ci_high,
+            "anchor_val_macro_f1": anchor_metrics["macro_f1"],
+            "corrected_val_macro_f1": corrected_metrics["macro_f1"],
+            "delta_val_macro_f1": macro_delta,
+            "anchor_val_balanced_accuracy": anchor_metrics["balanced_accuracy"],
+            "corrected_val_balanced_accuracy": corrected_metrics["balanced_accuracy"],
+            "delta_val_balanced_accuracy": bal_delta,
+        }
+        _CERT_CACHE[cache_key] = dict(base)
+    passed = (
+        base["delta_val"] > 0.0
+        and base["delta_ci_low"] >= -epsilon
+        and base["corrected_val_macro_f1"] >= base["anchor_val_macro_f1"] - 0.005
+        and base["corrected_val_balanced_accuracy"] >= base["anchor_val_balanced_accuracy"] - 0.005
+    )
+    out = dict(base)
+    out["certificate_passed"] = bool(passed)
+    return out
 
 
 def reliability_prior(val: pd.DataFrame) -> dict[str, Any]:
