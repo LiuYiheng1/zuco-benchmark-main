@@ -18,6 +18,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.adagtcn_aligned.nocs.anchor_nocs import (
+    binary_metrics as anchor_binary_metrics,
+    label_counts,
+    load_anchor_examples,
+    make_anchor_pipeline,
+    positive_prob,
+    prediction_rows,
+    safe_mix,
+    select_safe_alpha,
+    sklearn_model_metadata,
+)
 from src.adagtcn_aligned.nocs.dataset_nocs import load_split, make_datasets, make_loader
 from src.adagtcn_aligned.nocs.losses_nocs import nocs_loss
 from src.adagtcn_aligned.nocs.model_nocs import NOCSModel
@@ -26,6 +37,8 @@ from src.adagtcn_aligned.nocs.model_nocs import NOCSModel
 ABLATIONS = [
     "full",
     "residual",
+    "exact_gaze_anchor",
+    "safe_anchor",
     "stat_gaze",
     "stat_residual",
     "stat_full",
@@ -194,7 +207,351 @@ def write_rows_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer.writerows(rows)
 
 
+def prefixed(prefix: str, values: dict[str, float]) -> dict[str, float]:
+    return {prefix + "_" + key: value for key, value in values.items()}
+
+
+def heldout_subject(protocol: str) -> str:
+    return protocol.replace("Y16_LOSO_", "") if protocol.startswith("Y16_LOSO_") else ""
+
+
+def add_distribution_metrics(metrics: dict[str, Any], labels_by_role: dict[str, np.ndarray]) -> None:
+    for role, labels in labels_by_role.items():
+        counts = label_counts(labels)
+        metrics["%s_label_0" % role] = counts["0"]
+        metrics["%s_label_1" % role] = counts["1"]
+
+
+def run_exact_gaze_anchor(args: argparse.Namespace) -> dict[str, Any]:
+    set_seed(args.seed)
+    split = load_split(args.split_json, args.protocol)
+    data = load_anchor_examples(args.sequence_jsonl, split)
+    model = make_anchor_pipeline()
+    model.fit(data.features["train"], data.labels["train"])
+
+    probs = {role: positive_prob(model, data.features[role]) for role in ["train", "val", "test"]}
+    metrics_by_role = {role: anchor_binary_metrics(data.labels[role], probs[role]) for role in ["train", "val", "test"]}
+    subject = heldout_subject(args.protocol)
+    metrics: dict[str, Any] = {
+        "protocol": args.protocol,
+        "heldout_subject": subject,
+        "seed": args.seed,
+        "ablation": args.ablation,
+        "best_epoch": 0,
+        "best_val_auroc": metrics_by_role["val"]["auroc"],
+        "train_examples": int(data.labels["train"].size),
+        "val_examples": int(data.labels["val"].size),
+        "test_examples": int(data.labels["test"].size),
+        "raw_token_dim": data.raw_token_dim,
+        "feature_dim": data.feature_dim,
+        "gaze_dim": data.raw_token_dim,
+        "eeg_dim": int(data.component_raw_token_dims.get("eeg", 0)),
+        "anchor_val_auroc": metrics_by_role["val"]["auroc"],
+        "anchor_test_auroc": metrics_by_role["test"]["auroc"],
+        "anchor_test_macro_f1": metrics_by_role["test"]["macro_f1"],
+        "test_auroc": metrics_by_role["test"]["auroc"],
+        "test_macro_f1": metrics_by_role["test"]["macro_f1"],
+        "test_accuracy": metrics_by_role["test"]["accuracy"],
+        "test_balanced_accuracy": metrics_by_role["test"]["balanced_accuracy"],
+        "test_auprc": metrics_by_role["test"]["auprc"],
+    }
+    metrics.update(prefixed("train", metrics_by_role["train"]))
+    metrics.update(prefixed("val", metrics_by_role["val"]))
+    metrics.update(prefixed("test", metrics_by_role["test"]))
+    add_distribution_metrics(metrics, data.labels)
+
+    rows: list[dict[str, Any]] = []
+    for role in ["train", "val", "test"]:
+        rows.extend(prediction_rows(data.rows[role], role, args.protocol, subject, probs[role], "anchor"))
+
+    stem = "%s_%s_seed%d" % (args.ablation, args.protocol, args.seed)
+    metrics_path = args.output_dir / ("%s_metrics.csv" % stem)
+    preds_path = args.output_dir / ("%s_predictions.csv" % stem)
+    meta_path = args.output_dir / ("%s_meta.json" % stem)
+    history_path = args.output_dir / ("%s_history.csv" % stem)
+    write_single_row_csv(metrics, metrics_path)
+    write_rows_csv(rows, preds_path)
+    write_rows_csv([{"epoch": 0, "val_auroc": metrics_by_role["val"]["auroc"], "val_macro_f1": metrics_by_role["val"]["macro_f1"]}], history_path)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "args": json_safe(vars(args)),
+                "split": {
+                    "protocol": split.protocol,
+                    "train": split.train,
+                    "val": split.val,
+                    "test": split.test,
+                    "note": split.note,
+                },
+                "raw_token_dim": data.raw_token_dim,
+                "feature_dim": data.feature_dim,
+                "component_raw_token_dims": data.component_raw_token_dims,
+                "label_distribution": {role: label_counts(labels) for role, labels in data.labels.items()},
+                "pooling": "gaze valid-token mean + std with valid_ratio, sequence_length, valid_count",
+                "sklearn_pipeline": sklearn_model_metadata(model),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(json.dumps(metrics, indent=2), flush=True)
+    print("Wrote %s" % metrics_path)
+    print("Wrote %s" % preds_path)
+    print("Wrote %s" % meta_path)
+    return metrics
+
+
+def rows_to_prob(rows: list[dict[str, Any]], key: str = "y_prob_full") -> np.ndarray:
+    return np.asarray([float(row[key]) for row in rows], dtype=np.float64)
+
+
+def merge_safe_prediction_rows(
+    anchor_rows: list[dict[str, Any]],
+    corrected_rows: list[dict[str, Any]],
+    split_name: str,
+    anchor_prob: np.ndarray,
+    corrected_prob: np.ndarray,
+    safe_prob: np.ndarray,
+    selected_alpha: float,
+    selected_mode: str,
+) -> list[dict[str, Any]]:
+    if len(anchor_rows) != len(corrected_rows):
+        raise RuntimeError("Prediction alignment mismatch for %s: anchor=%d corrected=%d" % (split_name, len(anchor_rows), len(corrected_rows)))
+    safe_pred = (safe_prob >= 0.5).astype(np.int64)
+    corrected_pred = (corrected_prob >= 0.5).astype(np.int64)
+    out = []
+    for idx, anchor_row in enumerate(anchor_rows):
+        corrected_row = corrected_rows[idx]
+        if anchor_row.get("sequence_id") != corrected_row.get("sequence_id"):
+            raise RuntimeError(
+                "Prediction sequence_id mismatch for %s at %d: %s != %s"
+                % (split_name, idx, anchor_row.get("sequence_id"), corrected_row.get("sequence_id"))
+            )
+        item = dict(anchor_row)
+        item["split"] = split_name
+        item["y_prob_corrected"] = float(corrected_prob[idx])
+        item["y_pred_corrected"] = int(corrected_pred[idx])
+        item["y_prob_safe"] = float(safe_prob[idx])
+        item["y_pred_safe"] = int(safe_pred[idx])
+        item["selected_alpha"] = float(selected_alpha)
+        item["selected_mode"] = selected_mode
+        out.append(item)
+    return out
+
+
+def run_safe_anchor(args: argparse.Namespace) -> dict[str, Any]:
+    set_seed(args.seed)
+    device = torch.device(args.device)
+    split = load_split(args.split_json, args.protocol)
+    anchor_data = load_anchor_examples(args.sequence_jsonl, split)
+    anchor_model = make_anchor_pipeline()
+    anchor_model.fit(anchor_data.features["train"], anchor_data.labels["train"])
+    anchor_probs = {role: positive_prob(anchor_model, anchor_data.features[role]) for role in ["train", "val", "test"]}
+    anchor_metrics = {role: anchor_binary_metrics(anchor_data.labels[role], anchor_probs[role]) for role in ["train", "val", "test"]}
+
+    train_ds, val_ds, test_ds, meta = make_datasets(args.sequence_jsonl, split, cache_records=args.cache_records)
+    train_loader = make_loader(train_ds, args.batch_size, True, args.max_len, args.num_workers)
+    train_eval_loader = make_loader(train_ds, args.batch_size, False, args.max_len, args.num_workers)
+    val_loader = make_loader(val_ds, args.batch_size, False, args.max_len, args.num_workers)
+    test_loader = make_loader(test_ds, args.batch_size, False, args.max_len, args.num_workers)
+
+    model = NOCSModel(
+        eeg_dim=meta["eeg_dim"],
+        gaze_dim=meta["gaze_dim"],
+        n_subjects=len(meta["subject_to_idx"]),
+        d_model=args.d_model,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+        bidirectional=not args.causal,
+        ablation="full",
+        residual_beta=args.residual_beta,
+        stat_head=args.stat_head,
+    ).to(device)
+    weights = None
+    if args.class_weight == "balanced":
+        weights = class_weights_from_labels([ex["label"] for ex in train_ds.examples], device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    best_val_auroc = -1.0
+    best_epoch = 0
+    best_path = args.output_dir / ("%s_%s_seed%d_best.pt" % (args.ablation, args.protocol, args.seed))
+    patience_left = args.patience
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_logs: list[dict[str, float]] = []
+        for batch in train_loader:
+            batch = to_device(batch, device)
+            optimizer.zero_grad()
+            grl_scale = min(1.0, float(epoch) / max(args.epochs // 2, 1))
+            outputs = model(batch, grl_scale=grl_scale)
+            loss, logs = nocs_loss(
+                outputs,
+                batch["labels"],
+                batch["subjects"],
+                weights,
+                "full",
+                args.lambda_mono,
+                args.lambda_adv,
+                args.lambda_uncert,
+                args.lambda_supcon,
+                args.lambda_residual_norm,
+                args.lambda_gate,
+                args.mono_margin,
+                args.uncert_margin,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            train_logs.append(logs)
+
+        val_metrics, _ = evaluate(model, val_loader, device)
+        row = {"epoch": epoch, "corrected_val_auroc": val_metrics["auroc"], "corrected_val_macro_f1": val_metrics["macro_f1"]}
+        for key in train_logs[0] if train_logs else []:
+            row[key] = float(np.mean([log[key] for log in train_logs]))
+        history.append(row)
+
+        if val_metrics["auroc"] > best_val_auroc:
+            best_val_auroc = val_metrics["auroc"]
+            best_epoch = epoch
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "args": vars(args), "meta": meta, "corrected_ablation": "full"}, best_path)
+            patience_left = args.patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    checkpoint = torch.load(best_path, map_location=device)
+    model.load_state_dict(checkpoint["model"])
+    train_corrected_metrics, train_corrected_rows = evaluate(model, train_eval_loader, device)
+    val_corrected_metrics, val_corrected_rows = evaluate(model, val_loader, device)
+    test_corrected_metrics, test_corrected_rows = evaluate(model, test_loader, device)
+
+    corrected_probs = {
+        "train": rows_to_prob(train_corrected_rows),
+        "val": rows_to_prob(val_corrected_rows),
+        "test": rows_to_prob(test_corrected_rows),
+    }
+    selected_alpha, selected_mode, selection_metrics = select_safe_alpha(
+        anchor_data.labels["val"], anchor_probs["val"], corrected_probs["val"]
+    )
+    safe_probs = {
+        role: safe_mix(anchor_probs[role], corrected_probs[role], selected_alpha)
+        for role in ["train", "val", "test"]
+    }
+    safe_metrics = {role: anchor_binary_metrics(anchor_data.labels[role], safe_probs[role]) for role in ["train", "val", "test"]}
+    subject = heldout_subject(args.protocol)
+
+    metrics: dict[str, Any] = {
+        "protocol": args.protocol,
+        "heldout_subject": subject,
+        "seed": args.seed,
+        "ablation": args.ablation,
+        "best_epoch": best_epoch,
+        "best_val_auroc": best_val_auroc,
+        "train_examples": int(anchor_data.labels["train"].size),
+        "val_examples": int(anchor_data.labels["val"].size),
+        "test_examples": int(anchor_data.labels["test"].size),
+        "raw_token_dim": anchor_data.raw_token_dim,
+        "feature_dim": anchor_data.feature_dim,
+        "gaze_dim": meta["gaze_dim"],
+        "eeg_dim": meta["eeg_dim"],
+        "selected_alpha": float(selected_alpha),
+        "selected_mode": selected_mode,
+        "anchor_val_auroc": anchor_metrics["val"]["auroc"],
+        "corrected_val_auroc": val_corrected_metrics["auroc"],
+        "safe_val_auroc": safe_metrics["val"]["auroc"],
+        "anchor_test_auroc": anchor_metrics["test"]["auroc"],
+        "corrected_test_auroc": test_corrected_metrics["auroc"],
+        "safe_test_auroc": safe_metrics["test"]["auroc"],
+        "anchor_test_macro_f1": anchor_metrics["test"]["macro_f1"],
+        "corrected_test_macro_f1": test_corrected_metrics["macro_f1"],
+        "safe_test_macro_f1": safe_metrics["test"]["macro_f1"],
+        "safe_minus_anchor_test_auroc": safe_metrics["test"]["auroc"] - anchor_metrics["test"]["auroc"],
+        "safe_minus_corrected_test_auroc": safe_metrics["test"]["auroc"] - test_corrected_metrics["auroc"],
+        "test_auroc": safe_metrics["test"]["auroc"],
+        "test_macro_f1": safe_metrics["test"]["macro_f1"],
+        "test_accuracy": safe_metrics["test"]["accuracy"],
+        "test_balanced_accuracy": safe_metrics["test"]["balanced_accuracy"],
+        "test_auprc": safe_metrics["test"]["auprc"],
+    }
+    metrics.update(selection_metrics)
+    metrics.update(prefixed("train_anchor", anchor_metrics["train"]))
+    metrics.update(prefixed("val_anchor", anchor_metrics["val"]))
+    metrics.update(prefixed("test_anchor", anchor_metrics["test"]))
+    metrics.update(prefixed("train_corrected", train_corrected_metrics))
+    metrics.update(prefixed("val_corrected", val_corrected_metrics))
+    metrics.update(prefixed("test_corrected", test_corrected_metrics))
+    metrics.update(prefixed("train_safe", safe_metrics["train"]))
+    metrics.update(prefixed("val_safe", safe_metrics["val"]))
+    metrics.update(prefixed("test_safe", safe_metrics["test"]))
+    add_distribution_metrics(metrics, anchor_data.labels)
+
+    rows: list[dict[str, Any]] = []
+    corrected_rows_by_role = {"train": train_corrected_rows, "val": val_corrected_rows, "test": test_corrected_rows}
+    for role in ["train", "val", "test"]:
+        base = prediction_rows(anchor_data.rows[role], role, args.protocol, subject, anchor_probs[role], "anchor")
+        rows.extend(
+            merge_safe_prediction_rows(
+                base,
+                corrected_rows_by_role[role],
+                role,
+                anchor_probs[role],
+                corrected_probs[role],
+                safe_probs[role],
+                selected_alpha,
+                selected_mode,
+            )
+        )
+
+    stem = "%s_%s_seed%d" % (args.ablation, args.protocol, args.seed)
+    metrics_path = args.output_dir / ("%s_metrics.csv" % stem)
+    preds_path = args.output_dir / ("%s_predictions.csv" % stem)
+    meta_path = args.output_dir / ("%s_meta.json" % stem)
+    history_path = args.output_dir / ("%s_history.csv" % stem)
+    write_single_row_csv(metrics, metrics_path)
+    write_rows_csv(rows, preds_path)
+    write_rows_csv(history, history_path)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "args": json_safe(vars(args)),
+                "split": {
+                    "protocol": split.protocol,
+                    "train": split.train,
+                    "val": split.val,
+                    "test": split.test,
+                    "note": split.note,
+                },
+                "dataset": json_safe(meta),
+                "raw_token_dim": anchor_data.raw_token_dim,
+                "feature_dim": anchor_data.feature_dim,
+                "label_distribution": {role: label_counts(labels) for role, labels in anchor_data.labels.items()},
+                "anchor_sklearn_pipeline": sklearn_model_metadata(anchor_model),
+                "selected_alpha": selected_alpha,
+                "selected_mode": selected_mode,
+                "best_checkpoint": str(best_path),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(json.dumps(metrics, indent=2), flush=True)
+    print("Wrote %s" % metrics_path)
+    print("Wrote %s" % preds_path)
+    print("Wrote %s" % meta_path)
+    print("Wrote %s" % best_path)
+    return metrics
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    if args.ablation == "exact_gaze_anchor":
+        return run_exact_gaze_anchor(args)
+    if args.ablation == "safe_anchor":
+        return run_safe_anchor(args)
+
     set_seed(args.seed)
     device = torch.device(args.device)
     split = load_split(args.split_json, args.protocol)

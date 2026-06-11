@@ -63,6 +63,15 @@ def aggregate(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
         "full_minus_stat_macro_f1",
         "mean_residual_gate",
         "mean_residual_norm",
+        "anchor_test_auroc",
+        "anchor_test_macro_f1",
+        "corrected_test_auroc",
+        "corrected_test_macro_f1",
+        "safe_test_auroc",
+        "safe_test_macro_f1",
+        "safe_minus_anchor_test_auroc",
+        "safe_minus_corrected_test_auroc",
+        "selected_alpha",
     ]
     for group, items in sorted(grouped.items()):
         row: dict[str, Any] = {key: group, "n_runs": len(items)}
@@ -175,6 +184,25 @@ def paired_stats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "macro_f1_wilcoxon_p": wilcoxon_p(stat_macro_f1s, BASELINES["gaze_word_pool_lr_macro_f1"]),
                 }
             )
+        safe_minus_anchor = [
+            float(row["safe_minus_anchor_test_auroc"])
+            for row in ablation_rows
+            if row.get("safe_minus_anchor_test_auroc") not in {None, ""}
+        ]
+        if len(safe_minus_anchor) == len(ablation_rows) and safe_minus_anchor:
+            out.append(
+                {
+                    "comparison": "%s_safe_vs_anchor" % ablation,
+                    "ablation": ablation,
+                    "n": len(ablation_rows),
+                    "auroc_diff_mean": mean(safe_minus_anchor),
+                    "auroc_diff_ci_low": float(np.percentile(safe_minus_anchor, 2.5)),
+                    "auroc_diff_ci_high": float(np.percentile(safe_minus_anchor, 97.5)),
+                    "subjects_above_baseline": sum(1 for value in safe_minus_anchor if value > 0),
+                    "subjects_equal_baseline": sum(1 for value in safe_minus_anchor if value == 0),
+                    "subjects_below_baseline": sum(1 for value in safe_minus_anchor if value < 0),
+                }
+            )
     return out
 
 
@@ -190,6 +218,12 @@ def subject_table(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "test_auroc": row.get("test_auroc", ""),
                 "test_macro_f1": row.get("test_macro_f1", ""),
                 "test_accuracy": row.get("test_accuracy", ""),
+                "anchor_test_auroc": row.get("anchor_test_auroc", ""),
+                "corrected_test_auroc": row.get("corrected_test_auroc", ""),
+                "safe_test_auroc": row.get("safe_test_auroc", ""),
+                "safe_minus_anchor_test_auroc": row.get("safe_minus_anchor_test_auroc", ""),
+                "selected_alpha": row.get("selected_alpha", ""),
+                "selected_mode": row.get("selected_mode", ""),
             }
         )
     return out
